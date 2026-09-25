@@ -1,0 +1,1874 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; Figma-specific node tree → format-agnostic SceneNode.
+; All Figma field names and type strings live here, not in EVG.
+;
+; Two vocabularies show up in the raw kiwi. A Figma export writes the
+; editor's own names (`stackHorizontalPadding`, `stackPrimaryAlignItems`,
+; `imageScaleMode`, `lineHeight: {value, units}`); the bundled sample and
+; a JSON import use the REST API's (`paddingLeft`, `primaryAxisAlignItems`,
+; `scaleMode`, a bare number). Each reader below tries the kiwi name and
+; falls back to the REST one.
+
+Import "../scene/SceneNode.rgr"
+Import "../scene/SceneMatrix.rgr"
+Import "../FigModel.rgr"
+Import "../FigPath.rgr"
+Import "../KiwiValue.rgr"
+
+class FigToScene {
+    def doc:FigDoc (new FigDoc())
+    def outDoc:SceneDocument (new SceneDocument())
+    ; Node ids, for resolving an instance to the component it names. A map
+    ; rather than a scan: a file with a thousand instances over ten
+    ; thousand nodes would otherwise walk the node list a thousand times.
+    def byId:[string:FigNode]
+    def indexed:boolean false
+    ; How deep instance expansion currently is. A component that contains
+    ; an instance is normal; a cycle is not, and without a bound it is a
+    ; hang rather than a warning.
+    def instanceDepth:int 0
+
+    Constructor () {
+    }
+
+    ; A masking layer, turned into the clip around what it masks.
+    ;
+    ; In Figma a layer with `mask` set does not draw: it cuts the layers
+    ; ABOVE it in the same parent down to its own shape, until the next
+    ; masking layer takes over. A reader that ignores it draws the mask as
+    ; a shape of its own AND lets the layers it was holding back run past
+    ; the edge — an avatar's photo spilling out of its circle, an icon
+    ; drawn over its neighbour.
+    ;
+    ; WHAT THIS DOES NOT DO. The clip is the mask's box, not its outline,
+    ; because that is what the renderer has: an EVG clip is a rectangle.
+    ; For the rectangles and frames that most masks are — an icon's 24x24
+    ; frame, a photo's crop — the box IS the shape and the result is
+    ; exact. For a circle or a vector it cuts at the bounding box, which
+    ; removes less than Figma removes and never more, so the picture moves
+    ; towards the right one rather than past it. A rounded clip would need
+    ; a radius on the EVG clip command, and an exact one a stencil.
+    ;
+    ; A rotated mask is left alone: its box in the parent's axes is not
+    ; the region it covers, and a wrong clip is worse than none.
+    fn applyMasks:void (sn:SceneNode) {
+        def n:int (array_length sn.children)
+        def any:boolean false
+        def i:int 0
+        while (i < n) {
+            if ((itemAt sn.children i).isMask) {
+                any = true
+            }
+            i = (i + 1)
+        }
+        if (any == false) {
+            return
+        }
+        def out:[SceneNode]
+        def j:int 0
+        while (j < n) {
+            def ch:SceneNode (itemAt sn.children j)
+            if (ch.isMask == false) {
+                push out ch
+                j = (j + 1)
+            } {
+                ch.isMask = false
+                def usable:boolean (((ch.w > 0.0) && (ch.h > 0.0)) && (ch.hasXf == false))
+                if (usable == false) {
+                    ; Not a region this renderer can cut to. Draw it as it
+                    ; was drawn before, rather than dropping ink for a clip
+                    ; that would be wrong.
+                    push out ch
+                    j = (j + 1)
+                } {
+                    def g (new SceneNode())
+                    g.id = (ch.id + "#mask")
+                    g.name = (ch.name + " (mask)")
+                    g.kind = "container"
+                    g.sourceType = "MASK"
+                    g.x = ch.x
+                    g.y = ch.y
+                    g.w = ch.w
+                    g.h = ch.h
+                    g.clip = true
+                    j = (j + 1)
+                    ; Stop at the next masking layer and leave `j` on it,
+                    ; so the loop opens that one's clip rather than
+                    ; running off the end with it swallowed.
+                    def stop:boolean false
+                    while ((j < n) && (stop == false)) {
+                        def under:SceneNode (itemAt sn.children j)
+                        if under.isMask {
+                            stop = true
+                        } {
+                            under.x = (under.x - g.x)
+                            under.y = (under.y - g.y)
+                            push g.children under
+                            j = (j + 1)
+                        }
+                    }
+                    ; The mask itself is not drawn — but a mask with
+                    ; nothing above it masks nothing, and dropping it too
+                    ; would lose a shape Figma does draw in that case.
+                    if ((array_length g.children) > 0) {
+                        push out g
+                    } {
+                        push out ch
+                    }
+                }
+            }
+        }
+        sn.children = out
+    }
+
+    fn indexNodes:void () {
+        if indexed {
+            return
+        }
+        indexed = true
+        def i:int 0
+        while (i < (array_length doc.nodes)) {
+            def nd:FigNode (itemAt doc.nodes i)
+            set byId nd.id nd
+            i = (i + 1)
+        }
+    }
+
+    fn convertDoc:SceneDocument (src:FigDoc) {
+        doc = src
+        indexed = false
+        instanceDepth = 0
+        overridesSeen = 0
+        overridesUsed = 0
+        ; A second file opened into the same app must count its own keys,
+        ; not carry the first one's.
+        def freshKeys:[string:boolean]
+        keyListed = freshKeys
+        pathPrefix = ""
+        outDoc = (new SceneDocument())
+        outDoc.name = src.fileName
+        outDoc.source = "figma"
+        def i:int 0
+        while (i < (array_length src.pages)) {
+            def page:FigNode (itemAt src.pages i)
+            def sn:SceneNode (this.convertNode(page))
+            push outDoc.pages sn
+            outDoc.collectWarns(sn)
+            i = (i + 1)
+        }
+        return outDoc
+    }
+
+    fn convertNode:SceneNode (source:FigNode) {
+        def nd:FigNode source
+        if ((strlen pathPrefix) > 0) {
+            def key:string (pathPrefix + (FigToScene.overrideKeyOf(source)))
+            def raw:KiwiValue source.raw
+            def found:boolean false
+            ; What the designer typed, then what Figma made of it: the
+            ; authored entry carries the string and the derived one the
+            ; shaped glyphs and the size the instance laid it out at.
+            def auth@(optional):KiwiValue (get authored key)
+            if (null? auth) {
+            } {
+                raw = (FigToScene.mergeOverride(raw (unwrap auth)))
+                found = true
+            }
+            def hit@(optional):KiwiValue (get overrides key)
+            if (null? hit) {
+            } {
+                raw = (FigToScene.mergeOverride(raw (unwrap hit)))
+                found = true
+            }
+            if found {
+                overridesUsed = (overridesUsed + 1)
+                def merged:FigNode (FigModel.nodeFrom(raw))
+                merged.id = source.id
+                merged.parentId = source.parentId
+                merged.position = source.position
+                merged.typeName = source.typeName
+                merged.children = source.children
+                nd = merged
+            }
+        }
+        def t:string nd.typeName
+        def sn (new SceneNode())
+        sn.isMask = (nd.raw.childBool("mask" false))
+        ; AN ID OF ITS OWN FOR EVERY COPY. A component's layers are drawn
+        ; under every instance of it, and each copy used to carry the
+        ; COMPONENT's id — so a board with an arrow used three times had
+        ; three layers all called `2:143`. Everything that looks a layer up
+        ; walks the page and takes the first match, so clicking the third
+        ; arrow selected the first: the ring, the panel's numbers and the
+        ; handles all described a layer somewhere else on the board. The
+        ; outer layers were right because a top-level node appears once,
+        ; which is exactly the shape of it — the page was right and its
+        ; insides were not.
+        ;
+        ; The instance's own path is already computed for the override
+        ; table; it discriminates the copies for the same reason. After the
+        ; `#` so `FigApp.baseId` still recovers the node the file carries,
+        ; which is what the layer IS a copy of.
+        sn.id = nd.id
+        if ((strlen pathPrefix) > 0) {
+            sn.id = ((nd.id + "#") + pathPrefix)
+        }
+        sn.name = nd.name
+        sn.kind = (FigToScene.kindOf(t))
+        sn.sourceType = t
+        sn.visible = nd.visible
+        sn.opacity = nd.opacity
+        sn.w = nd.w
+        sn.h = nd.h
+        sn.xf = (SceneMatrix.fromFigma(nd.m00 nd.m01 nd.m02 nd.m10 nd.m11 nd.m12))
+        sn.x = nd.m02
+        sn.y = nd.m12
+        if (sn.xf.isTranslate()) {
+            sn.hasXf = false
+        } {
+            sn.hasXf = true
+            ; A turn, one factor and a mirror is all an angle can say. A
+            ; matrix that is anything else — a skew, or a scale that differs
+            ; by axis — is drawn as the nearest turn, which is a different
+            ; picture and not a soft one: said here rather than left to be
+            ; puzzled over.
+            if ((sn.xf.isSimilarity()) == false) {
+                sn.warn("a skew or a per-axis scale (drawn as the nearest turn)")
+            }
+        }
+        this.copyFills(nd sn)
+        if (t == "CANVAS") {
+            this.copyCanvasBackground(nd sn)
+        }
+        this.copyStrokes(nd sn)
+        this.copyRadius(nd sn)
+        this.copyLayout(nd sn)
+        this.copyText(nd sn)
+        this.copyClip(nd sn)
+        this.copyEffects(nd sn)
+        ; An image fill on a rectangle IS the image. Decided before the
+        ; geometry is read: the rounded avatar in a Figma export carries a
+        ; fillGeometry like every other node, and reading that first turned
+        ; it into a path, which then dropped the picture for a grey box.
+        ; And on anything else that holds nothing but the picture. A
+        ; FigJam STAMP — the profile photo people drop on a board — is a
+        ; container by type, and a container with an image fill got the
+        ; grey box that stands for a picture nothing can draw: the bytes
+        ; were in the file and read, and thrown away at the last step.
+        ; A node with children of its own is not turned into one, since an
+        ; image element has nowhere to put them.
+        if ((t == "IMAGE") || ((array_length sn.fills) > 0)) {
+            def imgFill:SceneFill (sn.firstFill())
+            def bare:boolean (((array_length nd.children) == 0) && ((strlen nd.symbolId) == 0))
+            if (nd.raw.hasField("derivedImmutableFrameData")) {
+                bare = false
+            }
+            def holdsImage:boolean false
+            if (sn.kind == "rect") {
+                holdsImage = true
+            }
+            if ((sn.kind == "container") && bare) {
+                holdsImage = true
+            }
+            if ((t == "IMAGE") || ((imgFill.kind == "image") && holdsImage)) {
+                if ((strlen imgFill.imageRef) > 0) {
+                    sn.kind = "image"
+                    sn.imageRef = imgFill.imageRef
+                    sn.imageFit = imgFill.imageFit
+                }
+            }
+        }
+        this.copyPath(nd sn)
+        if ((t == "LINE") && ((strlen sn.pathData) == 0)) {
+            sn.pathData = ("M0 0L" + (to_string nd.w) + " 0")
+            sn.setPathBox(nd.w nd.h)
+        }
+        if ((t == "ELLIPSE") && ((strlen sn.pathData) == 0)) {
+            def arc:KiwiValue (nd.raw.child("arcData"))
+            if (arc.isObject()) {
+                sn.pathData = (FigToScene.arcPath(nd.w nd.h arc))
+                sn.setPathBox(nd.w nd.h)
+            } {
+                sn.pathData = (FigToScene.ellipsePath(nd.w nd.h))
+                sn.setPathBox(nd.w nd.h)
+            }
+        }
+        ; A union or a subtract is drawn from the outline Figma flattened
+        ; for it. Without one there is nothing to draw — but an empty box
+        ; with no children is a node Figma draws nothing for either, and
+        ; reporting those said eight shapes were lost from a file that
+        ; was missing none. Only a node with a size or something under it
+        ; is ink that did not arrive.
+        if ((t == "BOOLEAN_OPERATION") || (t == "BOOLEAN_GROUP")) {
+            if ((strlen sn.pathData) == 0) {
+                def hasBox:boolean ((nd.w > 0.0) && (nd.h > 0.0))
+                if (hasBox || ((array_length nd.children) > 0)) {
+                    sn.warn("boolean operation without geometry")
+                }
+            }
+        }
+        def i:int 0
+        while (i < (array_length nd.children)) {
+            def ch:FigNode (itemAt nd.children i)
+            if ch.removed {
+            } {
+                if ch.visible {
+                    push sn.children (this.convertNode(ch))
+                }
+            }
+            i = (i + 1)
+        }
+        this.applyMasks(sn)
+        ; An instance's content is not in its own subtree. The node names a
+        ; component by guid and Figma draws that component's children under
+        ; the instance's transform, so a reader that stops here draws an
+        ; empty box wherever a file uses components — which is most files.
+        if ((array_length sn.children) == 0) {
+            if ((strlen nd.symbolId) > 0) {
+                this.expandInstance(nd sn)
+            } {
+                if (t == "INSTANCE") {
+                    ; Say which shape the node was in. An instance with a
+                    ; symbolData block that named nothing is a different
+                    ; problem from one with no symbol fields at all, and
+                    ; the two need different fixes.
+                    if nd.hadSymbolData {
+                        sn.warn("instance whose symbolData names no component")
+                    } {
+                        if nd.hasDerivedData {
+                            sn.warn("instance with only derived data (overrides), which is not read yet")
+                        } {
+                            sn.warn("instance with no symbol fields at all")
+                        }
+                    }
+                }
+            }
+        }
+        ; FigJam draws a sticky, a shape, a connector and a table from
+        ; layers it builds itself, which the file ships as derived data
+        ; rather than as children.
+        if ((array_length sn.children) == 0) {
+            this.expandImmutableFrame(nd sn)
+        }
+        this.strokeFromGeometry(nd sn)
+        ; What a picture does INSIDE its box is the paint's business, not the
+        ; node's: Figma keeps a turn and a matrix on the image fill — where
+        ; the picture is cropped and panned within the shape — and neither
+        ; is the node's transform. The crop now crosses to the list; the
+        ; turn still does not.
+        if ((array_length sn.fills) > 0) {
+            def imf:SceneFill (sn.firstFill())
+            if (imf.kind == "image") {
+                if ((imf.imageRotation > 0.01) || (imf.imageRotation < (0.0 - 0.01))) {
+                    sn.warn("an image turned inside its box (drawn upright)")
+                }
+            }
+        }
+        return sn
+    }
+
+    ; --- instance overrides ---------------------------------------------
+    ;
+    ; An instance draws its component's subtree, and everything the designer
+    ; changed inside that instance — the text above all — is stored on the
+    ; instance as derivedSymbolData: one NodeChange per overridden node,
+    ; carrying only the fields that differ and a guidPath naming the node in
+    ; the component it belongs to. Without them every instance shows the
+    ; component's own placeholder, which is what makes a real file read as a
+    ; blank template.
+    ;
+    ; The override is applied by merging its fields over the component
+    ; node's own and running the ordinary reader on the result, so an
+    ; overridden node goes through exactly the same conversion as any other
+    ; and nothing has to be reimplemented per field.
+
+    ; Overrides are keyed by where the node sits inside the outermost
+    ; instance: the guids of the instances descended through, then the
+    ; node's own. A file made of components nests them several deep, and
+    ; most overrides name a node inside a nested instance rather than one
+    ; of the component's own children — so the key has to carry the whole
+    ; path. Matching on the last guid alone, and worse, dropping the outer
+    ; instance's table on entering a nested one, placed 115 of 25,672.
+    def overrides:[string:KiwiValue]
+    ; The designer's own edits — `symbolData.symbolOverrides` — keyed the
+    ; same way. They are what the derived entries were computed from, and
+    ; they carry the fields the derived ones leave out: the text itself is
+    ; here, the glyphs it was shaped into are there.
+    def authored:[string:KiwiValue]
+    def pathPrefix:string ""
+    ; Distinct keys stored, and how many found their node. The two lists
+    ; overlap — an edit usually has a derived entry as well — so counting
+    ; entries rather than keys made one override count twice and the
+    ; report say 1,584 stored where the roadmap file holds 1,076.
+    def keyListed:[string:boolean]
+    def overridesSeen:int 0
+    def overridesUsed:int 0
+
+    ; WHAT THE ONES THAT MISS ARE. On that file 860 of the 1,076 keys find
+    ; their node, and the other 216 were traced one by one:
+    ;
+    ;   146  a variant that is not the one shown. Figma keeps the edits for
+    ;        every variant of a component set so switching back restores
+    ;        them; 110 of those entries name the variant's SYMBOL itself
+    ;        and 36 are the layers inside one.
+    ;    70  a layer hidden in the component, and the 52 layers under it.
+    ;        The walk turns a hidden child away before the override is
+    ;        merged, so an entry that switched one back on could not reach
+    ;        it — but not one of these 70 carries `visible`, so merging
+    ;        first would light nothing up.
+    ;
+    ; Both are dead: an entry that misses here is one Figma does not draw
+    ; either. The count is worth reporting as a tripwire — a file where it
+    ; climbs is a file to look at — but it is not a measure of what is
+    ; missing from the picture.
+
+    ; What an override entry calls this node. A component in this file is
+    ; a copy of one from a library, re-guided on the way in, and the paths
+    ; in `derivedSymbolData` and `symbolOverrides` still name the library's
+    ; guids — so the node carries `overrideKey`, its identity in that
+    ; namespace, and matching on the node's own guid placed 55 of 1,323.
+    ; A file whose components are its own (the bundled sample, a REST
+    ; import) has no overrideKey and is matched on the guid as before.
+    ; One key, counted once, however many of the two lists carry it.
+    fn countKey:void (key:string) {
+        def had@(optional):boolean (get keyListed key)
+        if (null? had) {
+            set keyListed key true
+            overridesSeen = (overridesSeen + 1)
+        }
+    }
+
+    sfn overrideKeyOf:string (nd:FigNode) {
+        def key:KiwiValue (nd.raw.child("overrideKey"))
+        if (key.isObject()) {
+            def k:string (FigModel.guidOf(key))
+            if ((strlen k) > 0) {
+                return k
+            }
+        }
+        return nd.id
+    }
+
+    ; "J/Y" for a node Y inside a nested instance J. An entry with no path
+    ; but an overrideKey names one node directly.
+    sfn overridePath:string (change:KiwiValue) {
+        def path:KiwiValue (change.child("guidPath"))
+        if (path.isObject()) {
+            def guids:KiwiValue (path.child("guids"))
+            if (guids.isArray()) {
+                def n:int (guids.itemCount())
+                def out:string ""
+                def i:int 0
+                while (i < n) {
+                    if (i > 0) {
+                        out = (out + "/")
+                    }
+                    out = (out + (FigModel.guidOf((guids.item(i)))))
+                    i = (i + 1)
+                }
+                if ((strlen out) > 0) {
+                    return out
+                }
+            }
+        }
+        def key:KiwiValue (change.child("overrideKey"))
+        if (key.isObject()) {
+            return (FigModel.guidOf(key))
+        }
+        return ""
+    }
+
+    ; The component node's fields with the override's laid over them. The
+    ; node keeps its own identity and its place in the tree — a derived
+    ; entry's guid and parentIndex describe the copy, not the original.
+    sfn mergeOverride:KiwiValue (base:KiwiValue over:KiwiValue) {
+        def out:KiwiValue (KiwiValue.fromObject())
+        def i:int 0
+        while (i < (array_length base.fieldNames)) {
+            out.put((itemAt base.fieldNames i) (itemAt base.fieldVals i))
+            i = (i + 1)
+        }
+        def j:int 0
+        while (j < (array_length over.fieldNames)) {
+            def name:string (itemAt over.fieldNames j)
+            if (FigToScene.isIdentityField(name)) {
+            } {
+                out.put(name (itemAt over.fieldVals j))
+            }
+            j = (j + 1)
+        }
+        return out
+    }
+
+    sfn isIdentityField:boolean (name:string) {
+        if (name == "guid") {
+            return true
+        }
+        if (name == "guidPath") {
+            return true
+        }
+        if (name == "guidPathTag") {
+            return true
+        }
+        if (name == "overrideKey") {
+            return true
+        }
+        if (name == "parentIndex") {
+            return true
+        }
+        if (name == "overrideLevel") {
+            return true
+        }
+        return (name == "type")
+    }
+
+    ; Whether this node puts anything on the canvas by itself.
+    sfn drawsNothing:boolean (sn:SceneNode) {
+        if ((array_length sn.fills) > 0) {
+            return false
+        }
+        if ((array_length sn.strokes) > 0) {
+            return false
+        }
+        if ((strlen sn.pathData) > 0) {
+            return false
+        }
+        if ((strlen sn.imageRef) > 0) {
+            return false
+        }
+        return ((strlen sn.text.characters) == 0)
+    }
+
+    ; Draw the named component's children in the instance's place. The
+    ; children are positioned relative to their parent, and the instance
+    ; supplies that parent, so they need no adjustment — an override that
+    ; changes one of them is not applied, which is a wrong colour or string
+    ; rather than a missing subtree.
+    fn expandInstance:void (nd:FigNode sn:SceneNode) {
+        this.indexNodes()
+        def master@(optional):FigNode (get byId nd.symbolId)
+        if (null? master) {
+            ; Usually a library component: the instance names it, the file
+            ; does not carry it, and Figma resolves it from the library.
+            sn.warn("instance names a component that is not in the file")
+            return
+        }
+        if (instanceDepth > 15) {
+            sn.warn("instances nested more than 15 deep — not expanding further")
+            return
+        }
+        def m:FigNode (unwrap master)
+        if (m.id == nd.id) {
+            sn.warn("instance names itself")
+            return
+        }
+        ; An instance clips the way the component it draws does: the flag
+        ; is on the component, and the node pointing at it carries only
+        ; `frameMaskDisabled`. Without this the screenshot inside a card ran
+        ; out of the side of the card.
+        if (m.isFrameLike()) {
+            if (nd.raw.hasField("clipsContent")) {
+            } {
+                if (nd.raw.childBool("frameMaskDisabled" false)) {
+                } {
+                    sn.clip = (m.raw.childBool("clipsContent" true))
+                }
+            }
+        }
+        if ((array_length m.children) == 0) {
+            ; A component can legitimately be a single shape — an icon, a
+            ; divider, a spacer — and an export copies its paint onto the
+            ; instance. There is nothing to borrow and nothing missing, so
+            ; this is only worth saying when the instance would otherwise
+            ; draw nothing at all.
+            if (FigToScene.drawsNothing(sn)) {
+                sn.warn("instance names a component with no children, and has nothing of its own to draw")
+            }
+            return
+        }
+        ; Everything inside this instance hangs off its own key, so the
+        ; entries can go in one table for the whole document and a nested
+        ; expansion adds to it rather than replacing it.
+        def childPrefix:string ((pathPrefix + (FigToScene.overrideKeyOf(nd))) + "/")
+        def derived:KiwiValue (nd.raw.child("derivedSymbolData"))
+        if (derived.isArray()) {
+            def d:int 0
+            while (d < (derived.itemCount())) {
+                def change:KiwiValue (derived.item(d))
+                def rel:string (FigToScene.overridePath(change))
+                if ((strlen rel) > 0) {
+                    def full:string (childPrefix + rel)
+                    def had@(optional):KiwiValue (get overrides full)
+                    if (null? had) {
+                        set overrides full change
+                    } {
+                        ; A nested instance carries entries for the same
+                        ; nodes as the one outside it, and they say what
+                        ; the COMPONENT laid out, not what this instance of
+                        ; it did. The outer table is the one that describes
+                        ; what is on the board, so an inner entry fills in
+                        ; only what the outer does not say. Replacing them
+                        ; wholesale is what drew a Stars instance resized
+                        ; to 112 as the 240 its component is: the inner
+                        ; entries carry no size at all, and they were
+                        ; overwriting the three the outer one computed.
+                        set overrides full (FigToScene.mergeOverride(change (unwrap had)))
+                    }
+                    this.countKey(full)
+                }
+                d = (d + 1)
+            }
+        }
+        def edits:KiwiValue ((nd.raw.child("symbolData")).child("symbolOverrides"))
+        if (edits.isArray()) {
+            def e:int 0
+            while (e < (edits.itemCount())) {
+                def edit:KiwiValue (edits.item(e))
+                def erel:string (FigToScene.overridePath(edit))
+                if ((strlen erel) > 0) {
+                    def efull:string (childPrefix + erel)
+                    def hadE@(optional):KiwiValue (get authored efull)
+                    if (null? hadE) {
+                        set authored efull edit
+                    } {
+                        set authored efull (FigToScene.mergeOverride(edit (unwrap hadE)))
+                    }
+                    this.countKey(efull)
+                }
+                e = (e + 1)
+            }
+        }
+        def keptPrefix:string pathPrefix
+        pathPrefix = childPrefix
+        instanceDepth = (instanceDepth + 1)
+        def i:int 0
+        while (i < (array_length m.children)) {
+            def ch:FigNode (itemAt m.children i)
+            if ch.removed {
+            } {
+                if ch.visible {
+                    push sn.children (this.convertNode(ch))
+                }
+            }
+            i = (i + 1)
+        }
+        instanceDepth = (instanceDepth - 1)
+        pathPrefix = keptPrefix
+        this.applyMasks(sn)
+    }
+
+    ; --- FigJam immutable frames -----------------------------------------
+    ;
+    ; A sticky, a shape with text, a connector, a table: none of them has
+    ; children. Figma builds the layers itself and the file ships only what
+    ; it built — `derivedImmutableFrameData.overrides`, one entry per layer
+    ; with its size, transform and flattened geometry, and
+    ; `nodeGenerationData.overrides`, the paints and the text for the same
+    ; layers, paired with it by `guidPath`. Reading neither is what opens a
+    ; FigJam board as a page of empty boxes.
+    ;
+    ; The first guid on a path names the layer — 0 the background, 1 the
+    ; text — and the rest name the node inside the frame. A table cell's
+    ; text and its background therefore share a path tail rather than a
+    ; prefix, and a layer is placed against the first entry with the same
+    ; tail, which is what puts the third cell's text in the third cell.
+    fn expandImmutableFrame:void (nd:FigNode sn:SceneNode) {
+        def parts:KiwiValue ((nd.raw.child("derivedImmutableFrameData")).child("overrides"))
+        def n:int (parts.itemCount())
+        if (n == 0) {
+            return
+        }
+        def styles:KiwiValue ((nd.raw.child("nodeGenerationData")).child("overrides"))
+        def styleByKey:[string:KiwiValue]
+        def si:int 0
+        while (si < (styles.itemCount())) {
+            def st:KiwiValue (styles.item(si))
+            def skey:string (FigToScene.overridePath(st))
+            if ((strlen skey) > 0) {
+                set styleByKey skey st
+            }
+            si = (si + 1)
+        }
+        ; What every layer of a kind has in common is not repeated on each
+        ; of them. A table ships two more style blocks, each keyed by a
+        ; layer guid with no geometry of its own: the cell — white, with
+        ; the 20% black rule that IS the grid — and the cell's text, with
+        ; its font and its ink. A per-cell entry then carries only what
+        ; differs, so read alone the entry for a heading says "Bold 24" and
+        ; names no colour at all: 5 tables drew as grey slabs with nothing
+        ; written in them and no grid. Which block is which is what it
+        ; carries, not where it sits — the one with text in it is the text.
+        def geomKeys:[string:boolean]
+        def gi:int 0
+        while (gi < n) {
+            set geomKeys (FigToScene.overridePath((parts.item(gi)))) true
+            gi = (gi + 1)
+        }
+        def boxDefault:KiwiValue (KiwiValue.nilVal())
+        def textDefault:KiwiValue (KiwiValue.nilVal())
+        ; A layer draws text if anything drawn under its guid does.
+        def textHeads:[string:boolean]
+        def ti:int 0
+        while (ti < n) {
+            def tp:KiwiValue (parts.item(ti))
+            def tkey:string (FigToScene.overridePath(tp))
+            def said:boolean ((tp.child("derivedTextData")).isObject())
+            if (said) {
+            } {
+                def ts@(optional):KiwiValue (get styleByKey tkey)
+                if (null? ts) {
+                } {
+                    said = (((unwrap ts).child("textData")).isObject())
+                }
+            }
+            if said {
+                set textHeads (FigToScene.pathHead(tkey)) true
+            }
+            ti = (ti + 1)
+        }
+        def di:int 0
+        while (di < (styles.itemCount())) {
+            def dst:KiwiValue (styles.item(di))
+            def dkey:string (FigToScene.overridePath(dst))
+            def drawn@(optional):boolean (get geomKeys dkey)
+            if (null? drawn) {
+                if ((FigToScene.pathTail(dkey)) == "") {
+                    if ((dst.child("textData")).isObject()) {
+                        textDefault = dst
+                    } {
+                        boxDefault = dst
+                    }
+                }
+            }
+            di = (di + 1)
+        }
+        ; The layer a node path was first drawn in. Its transform is where
+        ; that node sits in the frame, and the layers after it are drawn
+        ; against it rather than against the frame.
+        def anchorOf:[string:KiwiValue]
+        def anchorKey:[string:string]
+        def i:int 0
+        while (i < n) {
+            def part:KiwiValue (parts.item(i))
+            def key:string (FigToScene.overridePath(part))
+            def tail:string (FigToScene.pathTail(key))
+            def seen@(optional):string (get anchorKey tail)
+            if (null? seen) {
+                set anchorKey tail key
+                set anchorOf tail (part.child("transform"))
+            }
+            i = (i + 1)
+        }
+        def p:int 0
+        while (p < n) {
+            def part:KiwiValue (parts.item(p))
+            def key:string (FigToScene.overridePath(part))
+            def tail:string (FigToScene.pathTail(key))
+            ; Where the node this layer belongs to sits: its own place plus
+            ; every enclosing node that carries one.
+            def ox:double 0.0
+            def oy:double 0.0
+            def walk:string tail
+            def more:boolean true
+            while more {
+                def at@(optional):KiwiValue (get anchorOf walk)
+                if (null? at) {
+                } {
+                    def atf:KiwiValue (unwrap at)
+                    ox = (ox + (atf.childDouble("m02" 0.0)))
+                    oy = (oy + (atf.childDouble("m12" 0.0)))
+                }
+                if ((strlen walk) == 0) {
+                    more = false
+                } {
+                    walk = (FigToScene.pathParent(walk))
+                }
+            }
+            def own:KiwiValue (part.child("transform"))
+            def isAnchor:boolean false
+            def owner@(optional):string (get anchorKey tail)
+            if (null? owner) {
+            } {
+                if ((unwrap owner) == key) {
+                    isAnchor = true
+                }
+            }
+            if isAnchor {
+            } {
+                ; The anchor's own place is already in ox/oy.
+                ox = (ox + (own.childDouble("m02" 0.0)))
+                oy = (oy + (own.childDouble("m12" 0.0)))
+            }
+            def style:KiwiValue (KiwiValue.nilVal())
+            def hit@(optional):KiwiValue (get styleByKey key)
+            if (null? hit) {
+                ; A connector keeps one style block for its line, and the
+                ; line's caps are drawn in it. The block is the line's,
+                ; though, and not every layer's: a connector also ships a
+                ; label — the text and the rounded box behind it — and
+                ; those layers are styled only when there is a label to
+                ; draw. Lending them the line's paint filled that box
+                ; instead, so a divider drawn with a connector came out
+                ; with a green square sitting on one end of it.
+                if ((styles.itemCount()) == 1) {
+                    if (((part.child("strokeGeometry")).itemCount()) > 0) {
+                        style = (styles.item(0))
+                    }
+                }
+            } {
+                style = (unwrap hit)
+            }
+            def own:KiwiValue (FigToScene.mergeOverride(style part))
+            ; Under the layer's own fields, the default for its kind. Which
+            ; kind is the LAYER's, not this entry's: every `40000000:1/…`
+            ; in a table is the text of some cell, so a cell whose own
+            ; entry says nothing still takes the text default, where asking
+            ; the entry alone would have made it a box and painted it white.
+            def merged:KiwiValue own
+            def isText@(optional):boolean (get textHeads (FigToScene.pathHead(key)))
+            if (null? isText) {
+                if (boxDefault.isObject()) {
+                    merged = (FigToScene.mergeOverride(boxDefault own))
+                }
+            } {
+                if (textDefault.isObject()) {
+                    merged = (FigToScene.mergeOverride(textDefault own))
+                }
+            }
+            def tf (KiwiValue.fromObject())
+            tf.put("m00" (KiwiValue.fromDouble((own.childDouble("m00" 1.0)))))
+            tf.put("m01" (KiwiValue.fromDouble((own.childDouble("m01" 0.0)))))
+            tf.put("m02" (KiwiValue.fromDouble(ox)))
+            tf.put("m10" (KiwiValue.fromDouble((own.childDouble("m10" 0.0)))))
+            tf.put("m11" (KiwiValue.fromDouble((own.childDouble("m11" 1.0)))))
+            tf.put("m12" (KiwiValue.fromDouble(oy)))
+            merged.put("transform" tf)
+            def kind:string (FigToScene.framePartType(merged))
+            merged.put("type" (KiwiValue.fromString(kind)))
+            merged.put("name" (KiwiValue.fromString(nd.name)))
+            ; A layer with neither text nor geometry is the box the others
+            ; are laid out in. Its paints belong to them — painting them
+            ; here put a dark rectangle over every sticky, in the colour of
+            ; the sticky's own text.
+            if (kind == "FRAME") {
+                merged.put("fillPaints" (KiwiValue.fromArray()))
+                merged.put("strokePaints" (KiwiValue.fromArray()))
+            }
+            ; A connector's arrow head is a filled path, and the only
+            ; colour the file gives the connector is the line's.
+            if (nd.typeName == "CONNECTOR") {
+                if (((merged.child("fillGeometry")).itemCount()) > 0) {
+                    if (((merged.child("fillPaints")).itemCount()) == 0) {
+                        merged.put("fillPaints" (merged.child("strokePaints")))
+                    }
+                }
+            }
+            def layer:FigNode (FigModel.nodeFrom(merged))
+            layer.id = ((nd.id + "#") + key)
+            layer.parentId = nd.id
+            if layer.visible {
+                def lsn:SceneNode (this.convertNode(layer))
+                push sn.children lsn
+            }
+            p = (p + 1)
+        }
+    }
+
+    ; What to read the layer as. The frame does not say, so the fields do:
+    ; laid-out text is text, flattened geometry is a vector, and a layer
+    ; with neither is a box that holds the others.
+    sfn framePartType:string (v:KiwiValue) {
+        if ((v.child("derivedTextData")).isObject()) {
+            return "TEXT"
+        }
+        if ((v.child("textData")).isObject()) {
+            return "TEXT"
+        }
+        if (((v.child("fillGeometry")).itemCount()) > 0) {
+            return "VECTOR"
+        }
+        if (((v.child("strokeGeometry")).itemCount()) > 0) {
+            return "VECTOR"
+        }
+        return "FRAME"
+    }
+
+    ; "40000000:1/601:5/601:6" → "601:5/601:6": the path with the layer
+    ; dropped, which is the node the layer belongs to.
+    sfn pathTail:string (path:string) {
+        def n:int (strlen path)
+        def i:int 0
+        while (i < n) {
+            if ((charAt path i) == 47) {
+                return (substring path (i + 1) n)
+            }
+            i = (i + 1)
+        }
+        return ""
+    }
+
+    ; "40000000:1/601:5/601:6" → "40000000:1": the layer the path is in.
+    sfn pathHead:string (path:string) {
+        def n:int (strlen path)
+        def i:int 0
+        while (i < n) {
+            if ((charAt path i) == 47) {
+                return (substring path 0 i)
+            }
+            i = (i + 1)
+        }
+        return path
+    }
+
+    sfn pathParent:string (path:string) {
+        def n:int (strlen path)
+        def cut:int (0 - 1)
+        def i:int 0
+        while (i < n) {
+            if ((charAt path i) == 47) {
+                cut = i
+            }
+            i = (i + 1)
+        }
+        if (cut < 0) {
+            return ""
+        }
+        return (substring path 0 cut)
+    }
+
+    ; The stroke as Figma drew it. A file carries `strokeGeometry`: the
+    ; outline of the stroke itself, with its alignment, caps, joins, dashes
+    ; and per-side weights already applied. Filled in the stroke colour it
+    ; is exact, where a CSS border is a guess — and a stroke-only vector (a
+    ; chart line, a ring) has no fill geometry at all, so without this it
+    ; did not paint. Emitted as the LAST child, the way Figma paints a
+    ; frame's stroke over its content — a section's goes under it instead.
+    fn strokeFromGeometry:void (nd:FigNode sn:SceneNode) {
+        if ((array_length nd.strokeBlobs) == 0) {
+            return
+        }
+        if ((array_length sn.strokes) == 0) {
+            return
+        }
+        def st:SceneStroke (sn.firstStroke())
+        if (st.visible == false) {
+            return
+        }
+        def d:string ""
+        def i:int 0
+        while (i < (array_length nd.strokeBlobs)) {
+            def idx:int (itemAt nd.strokeBlobs i)
+            if ((idx >= 0) && (idx < (array_length doc.blobs))) {
+                d = (d + (FigPath.toSvg((itemAt doc.blobs idx))))
+            }
+            i = (i + 1)
+        }
+        if ((strlen d) == 0) {
+            return
+        }
+        def outline (new SceneNode())
+        ; From the LAYER's id and not the file node's: a component's layer is
+        ; copied under every instance, and an outline named after the node
+        ; would be one name shared by all of them.
+        outline.id = (sn.id + ":stroke")
+        outline.name = "stroke"
+        outline.kind = "path"
+        outline.sourceType = "STROKE_GEOMETRY"
+        outline.w = nd.w
+        outline.h = nd.h
+        outline.pathData = d
+        outline.setPathBox(nd.w nd.h)
+        outline.evenOdd = nd.strokeEvenOdd
+        def f (new SceneFill())
+        f.kind = "solid"
+        f.r = st.r
+        f.g = st.g
+        f.b = st.b
+        f.a = st.a
+        f.opacity = st.opacity
+        push outline.fills f
+        ; A frame paints its stroke over its content, so the outline is the
+        ; last child. A section does not: it is the board's own furniture,
+        ; and what is on it is drawn over its edge — a sticker straddling a
+        ; section's corner is whole in Figma, and was cut by a green line
+        ; here.
+        if (nd.typeName == "SECTION") {
+            def first:[SceneNode]
+            push first outline
+            def k:int 0
+            while (k < (array_length sn.children)) {
+                push first (itemAt sn.children k)
+                k = (k + 1)
+            }
+            sn.children = first
+        } {
+            push sn.children outline
+        }
+        ; The geometry paints the stroke; the renderer is told not to draw a
+        ; border as well. The stroke stays on the node — emptying it left
+        ; the layer saying nothing about its own edge, so the pane showed
+        ; no stroke at all and an edit to it changed a field nothing paints.
+        sn.strokeIsGeometry = true
+        sn.warnings = (this.dropStrokeWarnings(sn.warnings))
+    }
+
+    fn dropStrokeWarnings:[SceneWarn] (list:[SceneWarn]) {
+        def keep:[SceneWarn]
+        def i:int 0
+        while (i < (array_length list)) {
+            def w:SceneWarn (itemAt list i)
+            if ((w.feature == "strokeAlign OUTSIDE (drawn as center)") || (w.feature == "per-side stroke weights (drawn as one)")) {
+            } {
+                push keep w
+            }
+            i = (i + 1)
+        }
+        return keep
+    }
+
+    sfn kindOf:string (t:string) {
+        if ((t == "RECTANGLE") || (t == "ROUNDED_RECTANGLE") || (t == "SHAPE_WITH_TEXT")) {
+            return "rect"
+        }
+        if (t == "ELLIPSE") {
+            return "ellipse"
+        }
+        if (t == "LINE") {
+            return "line"
+        }
+        if (FigToScene.isVectorType(t)) {
+            return "path"
+        }
+        if (t == "TEXT") {
+            return "text"
+        }
+        if (t == "IMAGE") {
+            return "image"
+        }
+        return "container"
+    }
+
+    ; Types whose look IS their fillGeometry. Frames and rectangles carry a
+    ; fillGeometry too, but theirs is the box plus corner radius, which the
+    ; rect painter already draws — emitting it as well painted every card
+    ; twice and turned image-filled rectangles into paths.
+    sfn isVectorType:boolean (t:string) {
+        if ((t == "VECTOR") || (t == "STAR") || (t == "POLYGON") || (t == "REGULAR_POLYGON")) {
+            return true
+        }
+        if ((t == "BOOLEAN_OPERATION") || (t == "BOOLEAN_GROUP")) {
+            return true
+        }
+        if ((t == "ELLIPSE") || (t == "LINE")) {
+            return true
+        }
+        return false
+    }
+
+    fn copyFills:void (nd:FigNode sn:SceneNode) {
+        def i:int 0
+        while (i < (array_length nd.fills)) {
+            def p:FigPaint (itemAt nd.fills i)
+            def f (new SceneFill())
+            f.r = p.r
+            f.g = p.g
+            f.b = p.b
+            f.a = p.a
+            f.opacity = p.opacity
+            f.visible = p.visible
+            f.kind = "solid"
+            if (p.kind == "IMAGE") {
+                f.kind = "image"
+                f.imageRef = p.imageHash
+                f.imageFit = (FigToScene.scaleFit(p.scaleMode))
+                f.imageRotation = p.imageRotation
+                f.imageCropped = p.imageCropped
+                f.cropX = p.cropX
+                f.cropY = p.cropY
+                f.cropW = p.cropW
+                f.cropH = p.cropH
+            }
+            if (p.kind == "GRADIENT_LINEAR") {
+                f.kind = "gradient"
+                f.gradDir = 1
+                this.copyGradient(nd.raw i f)
+            }
+            push sn.fills f
+            i = (i + 1)
+        }
+    }
+
+    ; The canvas behind the frames. Figma paints every page on
+    ; `backgroundColor` (its default is the light #F5F5F5), which is what
+    ; makes a dark screen read as a screen and not as the page itself.
+    fn copyCanvasBackground:void (nd:FigNode sn:SceneNode) {
+        if ((array_length sn.fills) > 0) {
+            return
+        }
+        def f (new SceneFill())
+        f.kind = "solid"
+        f.r = 0.96
+        f.g = 0.96
+        f.b = 0.96
+        def col:KiwiValue (nd.raw.child("backgroundColor"))
+        if (col.isObject()) {
+            f.r = (col.childDouble("r" f.r))
+            f.g = (col.childDouble("g" f.g))
+            f.b = (col.childDouble("b" f.b))
+            f.a = (col.childDouble("a" 1.0))
+        }
+        f.opacity = (nd.raw.childDouble("backgroundOpacity" 1.0))
+        f.visible = (nd.raw.childBool("backgroundEnabled" true))
+        push sn.fills f
+    }
+
+    ; The two ends of the gradient, from the paint being converted — a node
+    ; can carry a flat fill with a gradient over it, and reading the first
+    ; paint every time gave the second one the first one's stops.
+    ;
+    ; The FIRST stop and the LAST. A display list carries two, so a gradient
+    ; authored with more keeps its ends and loses what is between them;
+    ; taking the first two instead ended the gradient where its second stop
+    ; was, and a red-amber-green scale stopped at amber.
+    ;
+    ; Each end keeps its own alpha. A gradient is as often a tint as a band
+    ; of colour — a track at 16% red over white, a caption fading out — and
+    ; dropped, those come out as the full colour: an alignment scale drawn
+    ; in poster red, and a white label on a black slab.
+    fn copyGradient:void (raw:KiwiValue index:int f:SceneFill) {
+        def paints:KiwiValue (raw.child("fillPaints"))
+        if (index >= (paints.itemCount())) {
+            return
+        }
+        def p0:KiwiValue (paints.item(index))
+        def stops:KiwiValue (p0.child("stops"))
+        def n:int (stops.itemCount())
+        if (n >= 2) {
+            def a:KiwiValue ((stops.item(0)).child("color"))
+            def b:KiwiValue ((stops.item(n - 1)).child("color"))
+            f.r = (a.childDouble("r" f.r))
+            f.g = (a.childDouble("g" f.g))
+            f.b = (a.childDouble("b" f.b))
+            f.a = (a.childDouble("a" 1.0))
+            f.gradR = (b.childDouble("r" f.r))
+            f.gradG = (b.childDouble("g" f.g))
+            f.gradB = (b.childDouble("b" f.b))
+            f.gradA = (b.childDouble("a" 1.0))
+        }
+    }
+
+    fn copyStrokes:void (nd:FigNode sn:SceneNode) {
+        def i:int 0
+        while (i < (array_length nd.strokes)) {
+            def p:FigPaint (itemAt nd.strokes i)
+            def s (new SceneStroke())
+            s.r = p.r
+            s.g = p.g
+            s.b = p.b
+            s.a = p.a
+            s.opacity = p.opacity
+            s.visible = p.visible
+            s.weight = nd.strokeWeight
+            s.wTop = (nd.raw.childDouble("borderTopWeight" nd.strokeWeight))
+            s.wRight = (nd.raw.childDouble("borderRightWeight" nd.strokeWeight))
+            s.wBottom = (nd.raw.childDouble("borderBottomWeight" nd.strokeWeight))
+            s.wLeft = (nd.raw.childDouble("borderLeftWeight" nd.strokeWeight))
+            def capRaw:string (nd.raw.childString("strokeCap" "NONE"))
+            def joinRaw:string (nd.raw.childString("strokeJoin" "MITER"))
+            s.lineCap = (FigToScene.capName(capRaw))
+            s.lineJoin = (FigToScene.joinName(joinRaw))
+            s.dash = (FigToScene.dashList(nd.raw))
+            s.align = (nd.raw.childString("strokeAlign" "CENTER"))
+            if (s.align == "INSIDE") {
+                s.align = "inside"
+            } {
+                if (s.align == "OUTSIDE") {
+                    s.align = "outside"
+                    ; Only an approximation when the file did not bring the
+                    ; stroke's own outline. With strokeGeometry the stroke
+                    ; is drawn exactly as Figma computed it — alignment,
+                    ; caps and joins already baked in — and warning about
+                    ; it says something was lost when nothing was.
+                    if ((array_length nd.strokeBlobs) == 0) {
+                        sn.warn("strokeAlign OUTSIDE (drawn as center)")
+                    }
+                } {
+                    s.align = "center"
+                }
+            }
+            push sn.strokes s
+            i = (i + 1)
+        }
+        ; Four weights are only worth carrying when they differ and the
+        ; corners are square: a rounded box's sides are arcs, not bars,
+        ; and drawing them as bars would be a worse picture than the one
+        ; weight this used to fall back to.
+        if ((array_length sn.strokes) > 0) {
+            if (nd.raw.childBool("borderStrokeWeightsIndependent" false)) {
+                def s0:SceneStroke (itemAt sn.strokes 0)
+                def same:boolean (((s0.wTop == s0.wRight) && (s0.wRight == s0.wBottom)) && (s0.wBottom == s0.wLeft))
+                def square:boolean ((sn.radius.any()) == false)
+                if ((same == false) && square) {
+                    def k:int 0
+                    while (k < (array_length sn.strokes)) {
+                        def one:SceneStroke (itemAt sn.strokes k)
+                        one.perSide = true
+                        k = (k + 1)
+                    }
+                } {
+                    if ((same == false) && ((array_length nd.strokeBlobs) == 0)) {
+                        sn.warn("per-side stroke weights on a rounded box (drawn as one)")
+                    }
+                }
+            }
+        }
+    }
+
+    fn copyRadius:void (nd:FigNode sn:SceneNode) {
+        def raw:KiwiValue nd.raw
+        def tl:double (raw.childDouble("rectangleTopLeftCornerRadius" nd.corner))
+        def tr:double (raw.childDouble("rectangleTopRightCornerRadius" nd.corner))
+        def br:double (raw.childDouble("rectangleBottomRightCornerRadius" nd.corner))
+        def bl:double (raw.childDouble("rectangleBottomLeftCornerRadius" nd.corner))
+        sn.radius.tl = tl
+        sn.radius.tr = tr
+        sn.radius.br = br
+        sn.radius.bl = bl
+        if ((tl == tr) && (tr == br) && (br == bl)) {
+            sn.radius.uniform = true
+        } {
+            sn.radius.uniform = false
+        }
+    }
+
+    fn copyLayout:void (nd:FigNode sn:SceneNode) {
+        def raw:KiwiValue nd.raw
+        def mode:string (raw.childString("stackMode" ""))
+        if (mode == "HORIZONTAL") {
+            sn.layout.mode = "row"
+        }
+        if (mode == "VERTICAL") {
+            sn.layout.mode = "column"
+        }
+        sn.layout.gap = (raw.childDouble("stackSpacing" 0.0))
+        ; Kiwi: horizontal/vertical padding name the left and top sides, and
+        ; the right/bottom fields are only written when they differ.
+        sn.layout.padL = (raw.childDouble("stackHorizontalPadding" (raw.childDouble("paddingLeft" 0.0))))
+        sn.layout.padT = (raw.childDouble("stackVerticalPadding" (raw.childDouble("paddingTop" 0.0))))
+        sn.layout.padR = (raw.childDouble("stackPaddingRight" (raw.childDouble("paddingRight" sn.layout.padL))))
+        sn.layout.padB = (raw.childDouble("stackPaddingBottom" (raw.childDouble("paddingBottom" sn.layout.padT))))
+        sn.layout.justify = (FigToScene.axisAlign((raw.childString("stackPrimaryAlignItems" (raw.childString("primaryAxisAlignItems" "MIN"))))))
+        sn.layout.alignItems = (FigToScene.axisAlign((raw.childString("stackCounterAlignItems" (raw.childString("counterAxisAlignItems" "MIN"))))))
+        def primary:string (raw.childString("stackPrimarySizing" (raw.childString("primaryAxisSizingMode" ""))))
+        def counter:string (raw.childString("stackCounterSizing" (raw.childString("counterAxisSizingMode" ""))))
+        def hugP:boolean (FigToScene.isHug(primary))
+        def hugC:boolean (FigToScene.isHug(counter))
+        if (sn.layout.mode == "row") {
+            sn.layout.hugW = hugP
+            sn.layout.hugH = hugC
+        }
+        if (sn.layout.mode == "column") {
+            sn.layout.hugH = hugP
+            sn.layout.hugW = hugC
+        }
+        sn.layout.grow = (raw.childDouble("stackChildPrimaryGrow" (raw.childDouble("layoutGrow" 0.0))))
+        def alignSelf:string (raw.childString("stackChildAlignSelf" (raw.childString("layoutAlign" ""))))
+        if (alignSelf == "STRETCH") {
+            sn.layout.stretch = true
+        }
+        def positioning:string (raw.childString("stackPositioning" (raw.childString("layoutPositioning" "AUTO"))))
+        if (positioning == "ABSOLUTE") {
+            sn.layout.absolute = true
+        }
+    }
+
+    sfn isHug:boolean (sizing:string) {
+        if (sizing == "RESIZE_TO_FIT") {
+            return true
+        }
+        if (sizing == "RESIZE_TO_FIT_WITH_IMPLICIT_SIZE") {
+            return true
+        }
+        if (sizing == "HUG") {
+            return true
+        }
+        return false
+    }
+
+    sfn scaleFit:string (mode:string) {
+        if (mode == "FIT") {
+            return "contain"
+        }
+        if (mode == "CROP") {
+            return "cover"
+        }
+        if (mode == "TILE") {
+            return "tile"
+        }
+        return "cover"
+    }
+
+    sfn axisAlign:string (v:string) {
+        if ((v == "CENTER") || (v == "center")) {
+            return "center"
+        }
+        if ((v == "MAX") || (v == "max")) {
+            return "end"
+        }
+        if ((v == "SPACE_BETWEEN") || (v == "SPACE_EVENLY") || (v == "space-between")) {
+            return "space-between"
+        }
+        return "start"
+    }
+
+    fn copyText:void (nd:FigNode sn:SceneNode) {
+        if ((strlen nd.characters) > 0) {
+            sn.text.characters = nd.characters
+        }
+        sn.text.fontSize = nd.fontSize
+        sn.text.fontFamily = nd.fontFamily
+        if (sn.kind != "text") {
+            return
+        }
+        def raw:KiwiValue nd.raw
+        def tcase:string (raw.childString("textCase" "ORIGINAL"))
+        if (tcase == "UPPER") {
+            sn.text.textCase = "upper"
+            sn.text.characters = (to_uppercase sn.text.characters)
+        }
+        if (tcase == "LOWER") {
+            sn.text.textCase = "lower"
+            sn.text.characters = (to_lowercase sn.text.characters)
+        }
+        def align:string (raw.childString("textAlignHorizontal" "LEFT"))
+        if (align == "CENTER") {
+            sn.text.align = "center"
+        } {
+            if (align == "RIGHT") {
+                sn.text.align = "right"
+            } {
+                if (align == "JUSTIFIED") {
+                    sn.text.align = "justify"
+                } {
+                    sn.text.align = "left"
+                }
+            }
+        }
+        def valign:string (raw.childString("textAlignVertical" "TOP"))
+        if (valign == "CENTER") {
+            sn.text.valign = "center"
+        }
+        if (valign == "BOTTOM") {
+            sn.text.valign = "bottom"
+        }
+        def resize:string (raw.childString("textAutoResize" "NONE"))
+        if (resize == "WIDTH_AND_HEIGHT") {
+            sn.text.autoResize = "both"
+        }
+        if (resize == "HEIGHT") {
+            sn.text.autoResize = "height"
+        }
+        def weight:string (raw.childString("fontWeight" ""))
+        if ((strlen weight) > 0) {
+            sn.text.fontWeight = weight
+        }
+        def fontNm:KiwiValue (raw.child("fontName"))
+        if (fontNm.isObject()) {
+            def style:string (fontNm.childString("style" ""))
+            if ((strlen style) > 0) {
+                sn.text.fontWeight = (FigToScene.weightOf(style))
+                if (FigToScene.hasWord(style "italic")) {
+                    sn.text.fontStyle = "italic"
+                }
+            }
+        }
+        ; The shaped result, when the file has one. Its font table names the
+        ; weight as a number, which beats guessing from the style string.
+        def derived:KiwiValue (raw.child("derivedTextData"))
+        def meta:KiwiValue (derived.child("fontMetaData"))
+        if ((meta.itemCount()) > 0) {
+            def m0:KiwiValue (meta.item(0))
+            def fw:int (m0.childInt("fontWeight" 0))
+            if (fw > 0) {
+                sn.text.fontWeight = (to_string fw)
+            }
+            if ((m0.childString("fontStyle" "NORMAL")) == "ITALIC") {
+                sn.text.fontStyle = "italic"
+            }
+        }
+        def lh:KiwiValue (raw.child("lineHeight"))
+        if (lh.isObject()) {
+            def units:string (lh.childString("units" "RAW"))
+            def val:double (lh.childDouble("value" 0.0))
+            if (units == "PIXELS") {
+                if (nd.fontSize > 0.0) {
+                    sn.text.lineHeight = (val / nd.fontSize)
+                }
+            } {
+                if (units == "PERCENT") {
+                    sn.text.lineHeight = (val / 100.0)
+                } {
+                    sn.text.lineHeight = val
+                }
+            }
+        } {
+            sn.text.lineHeight = (raw.childDouble("lineHeight" 0.0))
+        }
+        def ls:KiwiValue (raw.child("letterSpacing"))
+        if (ls.isObject()) {
+            def lunits:string (ls.childString("units" "PIXELS"))
+            def lval:double (ls.childDouble("value" 0.0))
+            if (lunits == "PERCENT") {
+                sn.text.letterSpacing = ((lval / 100.0) * nd.fontSize)
+            } {
+                sn.text.letterSpacing = lval
+            }
+        } {
+            sn.text.letterSpacing = (raw.childDouble("letterSpacing" 0.0))
+        }
+        sn.text.paragraphSpacing = (raw.childDouble("paragraphSpacing" 0.0))
+        def shaped:string (this.glyphOutline(nd))
+        if ((strlen shaped) > 0) {
+            ; The decorations belong to the shaped text, so they go on only
+            ; where it does: a run's underline with no glyphs under it is a
+            ; line drawn across nothing.
+            shaped = (shaped + (this.decorationOutline(nd)))
+        }
+        sn.text.outline = shaped
+        this.emojiLayers(nd sn)
+    }
+
+    ; An emoji is not an outline. Figma shapes the rest of a string into
+    ; glyph paths and draws a colour emoji as a picture, so the slot it
+    ; leaves in the glyph list carries the code point and, for a path, the
+    ; em square the picture goes in. Filled in the text's ink — which is
+    ; what a reader that draws every glyph does — that square is a black
+    ; block, and a table heading came out as "Status ■".
+    ;
+    ; The square is left out of the outline and the code point is drawn as
+    ; text instead, one span per emoji at the box the file gives it, in
+    ; whatever emoji font the machine has. That is the same bargain the
+    ; rest of the pipeline makes for text with no glyphs in the file, and
+    ; it is the only way to it here: the picture Figma drew is not in the
+    ; file, only the code point is.
+    fn emojiLayers:void (nd:FigNode sn:SceneNode) {
+        def derived:KiwiValue (nd.raw.child("derivedTextData"))
+        def glyphs:KiwiValue (derived.child("glyphs"))
+        def n:int (glyphs.itemCount())
+        def i:int 0
+        while (i < n) {
+            def g:KiwiValue (glyphs.item(i))
+            def cps:KiwiValue (g.child("emojiCodePoints"))
+            if ((cps.itemCount()) > 0) {
+                def fs:double (g.childDouble("fontSize" nd.fontSize))
+                def pos:KiwiValue (g.child("position"))
+                def px:double (pos.childDouble("x" 0.0))
+                def py:double (pos.childDouble("y" 0.0))
+                def adv:double (g.childDouble("advance" 1.0))
+                def chars:string ""
+                def c:int 0
+                while (c < (cps.itemCount())) {
+                    chars = (chars + (EVGCodepoint.toStr(((cps.item(c)).asInt(0)))))
+                    c = (c + 1)
+                }
+                def em (new SceneNode())
+                em.id = ((sn.id + ":emoji") + (to_string i))
+                em.name = "emoji"
+                em.kind = "text"
+                em.sourceType = "EMOJI"
+                em.x = px
+                ; The em square the file gives the picture sits from the
+                ; baseline up: 0.93 of it above, 0.07 below.
+                em.y = (py - (0.93 * fs))
+                em.w = (adv * fs)
+                em.h = fs
+                em.text.characters = chars
+                em.text.fontSize = fs
+                em.text.lineHeight = 1.0
+                em.text.align = "center"
+                def f (new SceneFill())
+                f.kind = "solid"
+                if ((array_length sn.fills) > 0) {
+                    def src:SceneFill (sn.firstFill())
+                    f.r = src.r
+                    f.g = src.g
+                    f.b = src.b
+                    f.a = src.a
+                }
+                push em.fills f
+                push sn.children em
+            }
+            i = (i + 1)
+        }
+    }
+
+    ; One SVG path for every glyph the editor laid out, in node pixels.
+    ; `derivedTextData.glyphs` carries each glyph's outline blob, its font
+    ; size and its baseline origin; the blob is in em units with y up.
+    fn glyphOutline:string (nd:FigNode) {
+        def derived:KiwiValue (nd.raw.child("derivedTextData"))
+        def glyphs:KiwiValue (derived.child("glyphs"))
+        def n:int (glyphs.itemCount())
+        if (n == 0) {
+            return ""
+        }
+        def d:string ""
+        def i:int 0
+        while (i < n) {
+            def g:KiwiValue (glyphs.item(i))
+            ; An emoji's slot carries the em square its picture goes in,
+            ; not an outline of it. Drawn, that is a black block.
+            if (((g.child("emojiCodePoints")).itemCount()) > 0) {
+                i = (i + 1)
+                continue
+            }
+            def idx:int (g.childInt("commandsBlob" (0 - 1)))
+            def fs:double (g.childDouble("fontSize" nd.fontSize))
+            def pos:KiwiValue (g.child("position"))
+            def px:double (pos.childDouble("x" 0.0))
+            def py:double (pos.childDouble("y" 0.0))
+            if ((idx >= 0) && (idx < (array_length doc.blobs))) {
+                d = (d + (FigPath.toSvgXf((itemAt doc.blobs idx) fs (0.0 - fs) px py)))
+            }
+            i = (i + 1)
+        }
+        return d
+    }
+
+    ; The line under an underlined run, and the one through a struck one.
+    ; Underlining is per-character styling — `textDecoration` on an entry of
+    ; the text's style table, over the characters that name it — so where
+    ; the line goes depends on the font's metrics and on where the run was
+    ; laid out, neither of which the node itself says. Figma has already
+    ; worked it out: `derivedTextData.decorations` is a rectangle per run,
+    ; in the node pixels the glyphs are laid out in. Painted as part of the
+    ; same path, so a decoration takes the text's own ink and needs nothing
+    ; taught to the renderer.
+    fn decorationOutline:string (nd:FigNode) {
+        def derived:KiwiValue (nd.raw.child("derivedTextData"))
+        def decs:KiwiValue (derived.child("decorations"))
+        def n:int (decs.itemCount())
+        def d:string ""
+        def i:int 0
+        while (i < n) {
+            def rects:KiwiValue ((decs.item(i)).child("rects"))
+            def m:int (rects.itemCount())
+            def j:int 0
+            while (j < m) {
+                def r:KiwiValue (rects.item(j))
+                def x:double (r.childDouble("x" 0.0))
+                def y:double (r.childDouble("y" 0.0))
+                def w:double (r.childDouble("w" 0.0))
+                def h:double (r.childDouble("h" 0.0))
+                if ((w > 0.0) && (h > 0.0)) {
+                    d = (d + "M" + (to_string x) + " " + (to_string y))
+                    d = (d + "L" + (to_string (x + w)) + " " + (to_string y))
+                    d = (d + "L" + (to_string (x + w)) + " " + (to_string (y + h)))
+                    d = (d + "L" + (to_string x) + " " + (to_string (y + h)) + "Z")
+                }
+                j = (j + 1)
+            }
+            i = (i + 1)
+        }
+        return d
+    }
+
+    ; CSS weight from a Figma style name: "Bold", "Semi Bold", "ExtraLight
+    ; Italic"… Case and spaces do not matter.
+    sfn weightOf:string (style:string) {
+        def s:string (to_lowercase style)
+        if ((FigToScene.hasWord(s "hairline")) || (FigToScene.hasWord(s "thin"))) {
+            return "100"
+        }
+        if ((FigToScene.hasWord(s "extralight")) || (FigToScene.hasWord(s "extra light")) || (FigToScene.hasWord(s "ultralight")) || (FigToScene.hasWord(s "ultra light"))) {
+            return "200"
+        }
+        if (FigToScene.hasWord(s "light")) {
+            return "300"
+        }
+        if (FigToScene.hasWord(s "medium")) {
+            return "500"
+        }
+        if ((FigToScene.hasWord(s "semibold")) || (FigToScene.hasWord(s "semi bold")) || (FigToScene.hasWord(s "demibold")) || (FigToScene.hasWord(s "demi bold"))) {
+            return "600"
+        }
+        if ((FigToScene.hasWord(s "extrabold")) || (FigToScene.hasWord(s "extra bold")) || (FigToScene.hasWord(s "ultrabold")) || (FigToScene.hasWord(s "ultra bold"))) {
+            return "800"
+        }
+        if ((FigToScene.hasWord(s "black")) || (FigToScene.hasWord(s "heavy"))) {
+            return "900"
+        }
+        if (FigToScene.hasWord(s "bold")) {
+            return "700"
+        }
+        return "400"
+    }
+
+    sfn hasWord:boolean (s:string needle:string) {
+        def hay:string (to_lowercase s)
+        def n:int (strlen hay)
+        def m:int (strlen needle)
+        if (m > n) {
+            return false
+        }
+        def i:int 0
+        while (i <= (n - m)) {
+            def ok:boolean true
+            def j:int 0
+            while (j < m) {
+                if ((charAt hay (i + j)) != (charAt needle j)) {
+                    ok = false
+                    j = m
+                }
+                j = (j + 1)
+            }
+            if ok {
+                return true
+            }
+            i = (i + 1)
+        }
+        return false
+    }
+
+    fn copyClip:void (nd:FigNode sn:SceneNode) {
+        def t:string nd.typeName
+        if ((t == "FRAME") || (t == "SLIDE") || (t == "COMPONENT") || (t == "SYMBOL") || (t == "SECTION")) {
+            def disabled:boolean (nd.raw.childBool("frameMaskDisabled" false))
+            def clips:boolean (nd.raw.childBool("clipsContent" true))
+            if disabled {
+                sn.clip = false
+            } {
+                sn.clip = clips
+            }
+        }
+    }
+
+    fn copyEffects:void (nd:FigNode sn:SceneNode) {
+        def fx:KiwiValue (nd.raw.child("effects"))
+        def i:int 0
+        while (i < (fx.itemCount())) {
+            def e:KiwiValue (fx.item(i))
+            def kind:string (e.childString("type" ""))
+            def on:boolean (e.childBool("visible" true))
+            if (on == false) {
+                kind = ""
+            }
+            if ((kind == "DROP_SHADOW") || (kind == "drop-shadow")) {
+                def s (new SceneEffect())
+                s.kind = "drop-shadow"
+                s.x = (e.childDouble("offset.x" (e.child("offset").childDouble("x" 0.0))))
+                s.y = (e.childDouble("offset.y" (e.child("offset").childDouble("y" 0.0))))
+                s.blur = (e.childDouble("radius" 0.0))
+                s.spread = (e.childDouble("spread" 0.0))
+                def col:KiwiValue (e.child("color"))
+                if (col.isObject()) {
+                    s.r = (col.childDouble("r" 0.0))
+                    s.g = (col.childDouble("g" 0.0))
+                    s.b = (col.childDouble("b" 0.0))
+                    s.a = (col.childDouble("a" 0.35))
+                }
+                push sn.effects s
+            } {
+                if (kind == "BACKGROUND_BLUR") {
+                    def bb (new SceneEffect())
+                    bb.kind = "backdrop-blur"
+                    bb.blur = (e.childDouble("radius" 0.0))
+                    push sn.effects bb
+                } {
+                    if ((kind == "INNER_SHADOW") || (kind == "LAYER_BLUR")) {
+                        sn.warn(kind)
+                    }
+                }
+            }
+            i = (i + 1)
+        }
+    }
+
+    fn copyPath:void (nd:FigNode sn:SceneNode) {
+        if ((FigToScene.isVectorType(nd.typeName)) == false) {
+            return
+        }
+        if ((array_length nd.fillBlobs) == 0) {
+            return
+        }
+        def d:string ""
+        def i:int 0
+        while (i < (array_length nd.fillBlobs)) {
+            def idx:int (itemAt nd.fillBlobs i)
+            if ((idx >= 0) && (idx < (array_length doc.blobs))) {
+                d = (d + (FigPath.toSvg((itemAt doc.blobs idx))))
+            }
+            i = (i + 1)
+        }
+        if ((strlen d) > 0) {
+            sn.pathData = d
+            sn.setPathBox(sn.w sn.h)
+            if (sn.kind == "rect") {
+                sn.kind = "path"
+            }
+        }
+        sn.evenOdd = nd.evenOdd
+    }
+
+    ; An ELLIPSE with `arcData` is a wedge, a ring or a ring's slice — the
+    ; "arc tool" in Figma, and a donut chart in every deck made with it.
+    ; Drawn as its whole ellipse it is not a small error: a 20-degree slice
+    ; comes out as a filled circle, eighteen times the ink.
+    ;
+    ; The field holds `startingAngle` and `endingAngle` in radians from
+    ; three o'clock, growing clockwise because y points down, and
+    ; `innerRadius` as a fraction of the radius. SVG's own arc takes the
+    ; two endpoints and a direction rather than two angles, so the angles
+    ; become points here; `1` for the sweep flag is that same clockwise.
+    ;
+    ; An arc of a full turn has no endpoints to give — the two coincide and
+    ; SVG draws nothing — so a whole ellipse and a whole ring are each cut
+    ; into two halves, and a ring's inner edge runs backwards so the hole
+    ; is a hole under either fill rule.
+    sfn arcPath:string (w:double h:double arc:KiwiValue) {
+        def rx:double (w / 2.0)
+        def ry:double (h / 2.0)
+        def a0:double (arc.childDouble("startingAngle" 0.0))
+        def a1:double (arc.childDouble("endingAngle" 6.283185307179586))
+        def inner:double (arc.childDouble("innerRadius" 0.0))
+        if (inner < 0.0) {
+            inner = 0.0
+        }
+        if (inner > 1.0) {
+            inner = 1.0
+        }
+        def sweep:double (a1 - a0)
+        if (sweep < 0.0) {
+            sweep = (0.0 - sweep)
+            def t:double a0
+            a0 = a1
+            a1 = t
+        }
+        if (sweep > 6.2831853) {
+            sweep = 6.283185307179586
+            a1 = (a0 + sweep)
+        }
+        ; Nothing swept is nothing drawn, and a whole turn with no hole is
+        ; the plain ellipse the reader already had.
+        if (sweep < 0.0001) {
+            return ""
+        }
+        def whole:boolean (sweep > 6.2831)
+        if (whole && (inner < 0.0001)) {
+            return (FigToScene.ellipsePath(w h))
+        }
+        def irx:double (rx * inner)
+        def iry:double (ry * inner)
+        if whole {
+            def half:double (a0 + 3.141592653589793)
+            def d:string (FigToScene.arcMove(rx ry rx ry a0))
+            d = (d + (FigToScene.arcTo(rx ry rx ry half 0 1)))
+            d = (d + (FigToScene.arcTo(rx ry rx ry a0 0 1)) + "Z")
+            ; The hole runs the other way, which empties it under the
+            ; nonzero rule as well as the even-odd one.
+            d = (d + (FigToScene.arcMove(rx ry irx iry a0)))
+            d = (d + (FigToScene.arcTo(rx ry irx iry half 0 0)))
+            d = (d + (FigToScene.arcTo(rx ry irx iry a0 0 0)) + "Z")
+            return d
+        }
+        def big:int 0
+        if (sweep > 3.141592653589793) {
+            big = 1
+        }
+        def out:string (FigToScene.arcMove(rx ry rx ry a0))
+        out = (out + (FigToScene.arcTo(rx ry rx ry a1 big 1)))
+        if (inner < 0.0001) {
+            ; A wedge closes through the middle.
+            out = ((out + "L" + (to_string rx) + " " + (to_string ry)) + "Z")
+            return out
+        }
+        out = (out + (FigToScene.arcLine(rx ry irx iry a1)))
+        out = (out + (FigToScene.arcTo(rx ry irx iry a0 big 0)) + "Z")
+        return (out + "")
+    }
+
+    sfn arcX:double (cx:double rr:double angle:double) {
+        return (cx + (rr * (cos angle)))
+    }
+
+    sfn arcMove:string (cx:double cy:double rx:double ry:double a:double) {
+        def x:double (FigToScene.arcX(cx rx a))
+        def y:double (cy + (ry * (sin a)))
+        return ("M" + (to_string x) + " " + (to_string y))
+    }
+
+    sfn arcLine:string (cx:double cy:double rx:double ry:double a:double) {
+        def x:double (FigToScene.arcX(cx rx a))
+        def y:double (cy + (ry * (sin a)))
+        return ("L" + (to_string x) + " " + (to_string y))
+    }
+
+    sfn arcTo:string (cx:double cy:double rx:double ry:double a:double big:int dir:int) {
+        def x:double (FigToScene.arcX(cx rx a))
+        def y:double (cy + (ry * (sin a)))
+        def d:string ("A" + (to_string rx) + " " + (to_string ry) + " 0 ")
+        d = (d + (to_string big) + " " + (to_string dir) + " ")
+        return (d + (to_string x) + " " + (to_string y))
+    }
+
+    ; Figma's names for a line's ends and corners, in SVG's. The arrow
+    ; heads — ARROW_LINES, ARROW_EQUILATERAL — are a shape at the end of
+    ; the line rather than a cap, and are not one of these; drawn as a
+    ; round end they are at least the right thickness, which is nearer
+    ; than the squared-off stop they had.
+    sfn capName:string (fig:string) {
+        if (fig == "ROUND") {
+            return "round"
+        }
+        if (fig == "SQUARE") {
+            return "square"
+        }
+        if (fig == "NONE") {
+            return "butt"
+        }
+        return "round"
+    }
+
+    sfn joinName:string (fig:string) {
+        if (fig == "ROUND") {
+            return "round"
+        }
+        if (fig == "BEVEL") {
+            return "bevel"
+        }
+        return "miter"
+    }
+
+    ; `dashPattern`, as SVG writes it. Figma's list alternates on and off
+    ; the same way, so this is a spelling change and not a conversion.
+    sfn dashList:string (raw:KiwiValue) {
+        def dp:KiwiValue (raw.child("dashPattern"))
+        if ((dp.isArray()) == false) {
+            return ""
+        }
+        def n:int (dp.itemCount())
+        if (n == 0) {
+            return ""
+        }
+        def out:string ""
+        def i:int 0
+        while (i < n) {
+            if (i > 0) {
+                out = (out + " ")
+            }
+            out = (out + (to_string ((dp.item(i)).asDouble(0.0))))
+            i = (i + 1)
+        }
+        return out
+    }
+
+    sfn ellipsePath:string (w:double h:double) {
+        def rx:double (w / 2.0)
+        def ry:double (h / 2.0)
+        def cx:double rx
+        def cy:double ry
+        def w2:double w
+        return ("M0 " + (to_string cy) + "A" + (to_string rx) + " " + (to_string ry) + " 0 1 0 " + (to_string w2) + " " + (to_string cy) + "A" + (to_string rx) + " " + (to_string ry) + " 0 1 0 0 " + (to_string cy) + "Z")
+    }
+}

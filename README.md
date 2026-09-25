@@ -1,0 +1,965 @@
+# DesignViewer
+
+Figma `.fig` / `.deck` / `.jam` reader and viewer, written in
+[Ranger](https://github.com/terotests/Ranger). Moved here from Ranger's
+`gallery/figma`.
+
+**License: AGPL-3.0-or-later** (see `LICENSE`).
+
+Live page: <https://terotests.github.io/DesignViewer/>
+
+## Building
+
+The sources expect to sit at `gallery/figma/` inside a Ranger checkout: they
+use Ranger's compiler (`dist/rgrc.js`), `lib/evg`, `lib/zip`, `gallery/zip`,
+`gallery/zstd` and the test harness under `gallery/game_engine/v2/tests/harness/`.
+
+```sh
+git clone https://github.com/terotests/Ranger
+rm -rf Ranger/gallery/figma
+git clone https://github.com/terotests/DesignViewer Ranger/gallery/figma
+cd Ranger
+bash scripts/rgr-suite.sh ./gallery/figma/tests/FigTest.rgr ./gallery/figma/bin FigTest.js
+bash gallery/figma/web/standalone/build.sh --out _site   # the live page
+node gallery/figma/web/standalone/smoke.mjs
+```
+
+`.github/workflows/pages.yml` does the same on every push to `main`: a sparse,
+shallow checkout of Ranger (no `npm ci`), this repository at `gallery/figma`,
+tests, build, smoke test, and deploy to GitHub Pages. The Ranger ref is
+`RANGER_REF` in the workflow (`master`); a manual run can override it.
+
+The `npm run figma:*` commands below are Ranger's `package.json` scripts and
+are run from the Ranger checkout.
+
+---
+
+## Fig reader (Ranger + EVG)
+
+Read a Figma `.fig` / `.deck` / `.jam` in Ranger, walk the kiwi node tree,
+normalize it to a format-agnostic **scene graph**, and paint that with EVG.
+The same code runs in Node and in the browser — the page at
+[`/figma/`](https://terotests.github.io/Ranger/figma/) opens a file you pick.
+Nothing is uploaded.
+
+```text
+.fig / Figma JSON
+       ↓
+Figma parser / loader
+       ↓
+Normalized Scene Graph     gallery/figma/src/scene
+       ↓
+Figma → EVG adapter        gallery/figma/src/evg/SceneToEVG.rgr
+       ↓
+EVG tree + styles + assets
+       ↓
+Ranger EVG renderer
+```
+
+Figma-specific logic stops at `FigToScene`. The EVG renderer is not taught
+Figma types. A later SVG / Sketch / custom UI importer can emit the same
+`SceneNode` tree.
+
+This is the OpenFig pipeline written in Ranger, so the two can be timed on
+the same bytes. OpenFig is
+[`openfig-cli`](https://github.com/OpenFig-org/openfig-cli) /
+[`openfig-core`](https://github.com/OpenFig-org/openfig-core).
+
+Ranger throughout: the ZIP around a `.fig` and the DEFLATE inside it are
+`gallery/zip`, and the zstd the message chunk of a Figma export uses is
+`gallery/zstd`. There is no host hook and no vendored decoder, so the
+reader works on every target the compiler emits rather than only on
+JavaScript.
+
+
+## Writing: EVG → Figma, and back
+
+The reader had no counterpart, so a `.fig` was something this repository could
+look at and never answer. It has one now, and it is built on machinery that was
+already here: `KiwiSchema.encode`, `KiwiBuffer`'s write side,
+`FigDeflate.wrapStored` and `FigCanvas.assemble` have been writing the sample
+file in `FigSample` all along. What was missing was the step above them —
+turning a document someone MADE into that message instead of one written out by
+hand.
+
+```text
+ .fig ──FigToScene──► SceneDocument ──SceneToEVG──► EVG ──► render / measure / patch
+   ▲                       ▲                         │
+   │                       │                         │
+   └───SceneToFig──────────┴──────EvgToScene─────────┘
+```
+
+```bash
+npm run figma:to-evg   -- file.fig page.evg.json 0   # a page, as an editable document
+npm run agent          -- outline page.evg.json      # then the whole agent toolchain
+npm run agent          -- patch   page.evg.json ops.json
+npm run figma:from-evg -- page.evg.json edited.fig   # back to a file Figma opens
+npm run figma:rewrite  -- in.fig out.fig             # read and write, unchanged
+```
+
+### A running app, as a file
+
+The first thing put through this door that nobody designed for it was a UI —
+RealTrainer's own screens, taken out of the running app rather than out of a
+fixture:
+
+```bash
+npm run rt:evg -- / gallery/realtrainer/out/home.evg.json
+node gallery/figma/bin/fig_cli.js from-evg \
+     gallery/realtrainer/out/home.evg.json home.fig 430 932
+```
+
+`rt:evg` stops the app after it has built its element tree and writes the tree
+down; the second line turns that into a file. No screenshot anywhere in the
+chain — what lands in Figma is the boxes, the type and the icon outlines.
+
+It found four things, and all four were losses nothing reported:
+
+| | |
+| --- | --- |
+| **the page** | a UI says it is `100%` of a window it does not name, so the conversion fell back to 1200x900 and a phone screen came out stretched across it. `EvgToScene.pageW/pageH` — and the two optional arguments to `from-evg` — are the caller saying which window. |
+| **a label with a background** | a Figma text node's fills are its LETTERS, so an element carrying both a string and a background cannot be one node: written as text it kept the words and lost the pill. Every tag on the page. It is a frame with a text child now. |
+| **an icon** | a picture written as an `svg` DOCUMENT rather than as one `d` attribute reached the file as an empty box — silently, because the path branch only ever looked at `svgPath`. `EvgToScene.putSvg` parses it with the same reader the painters use and writes each shape as a vector child. |
+| **a heading on two lines** | a label written into a fixed box is re-broken by whoever opens the file, against a face the layout never measured. A box that is one line tall now says `textAutoResize: WIDTH_AND_HEIGHT`, so the string sizes the box instead. |
+
+The last of those was lost twice over, and the second reason is the useful one:
+`textAutoResize` and `lineHeight` were both being written and **neither was in
+the schema**. Encoding walks the SCHEMA — `KiwiEncode.encodeMessage` emits the
+fields the schema declares and skips everything else — so a field nobody
+declared is not refused, it simply does not reach the file. Both are declared
+now, and `from-evg` prints what it could not carry:
+
+```text
+  no field in the schema for  NodeChange.textTruncation
+```
+
+### A vector is a NETWORK, and the geometry is the answer beside it
+
+Every icon of the first UI that opened in Figma opened as an empty box. The
+outlines were in the file and correct: `fillGeometry` with a commands blob, the
+same one `FigPath` decodes when reading.
+
+But `fillGeometry` is DERIVED. What a vector node IS, to Figma, is the thing
+its pen tool edits — vertices joined by segments, grouped into regions — kept
+in `vectorData.vectorNetworkBlob`, with the flattened geometry stored beside
+it. A node with only the geometry has nothing to draw.
+
+`FigVectorNet` writes that network, in a format read out of
+`fixtures/health.fig` rather than guessed — twenty-six of its blobs parse as
+this and re-encode to the same bytes:
+
+```text
+uint32  vertexCount, segmentCount, regionCount
+vertex   uint32 style, float x, float y
+segment  uint32 style, uint32 startVertex, float t0x, float t0y,
+                       uint32 endVertex,   float t1x, float t1y
+region   uint32 windingRule, uint32 loopCount,
+         loop: uint32 segmentCount, uint32 segmentIndex[]
+```
+
+A segment's tangents are the cubic's control points measured FROM the vertex
+each belongs to (`t0 = c1 - start`, `t1 = c2 - end`), which is why a straight
+line needs no special case: it is a segment with two zero tangents.
+
+### A font Figma can find, and no hidden layers
+
+Two smaller things the same import turned up:
+
+**`Arial` is a system font.** Every browser has it and Figma's web app does
+not, so the file opened with "Missing font — Arial" in front of the drawing.
+`FigFonts` maps the families Figma cannot resolve onto the ones it ships or
+hosts — Arial, Helvetica, system-ui and `sans-serif` to Inter, the serif
+families to Roboto Serif, the monospace ones to Roboto Mono — and passes
+everything else through, because a document set in Open Sans names a font
+Figma hosts. The substitution is REPORTED, once per family.
+
+**`display: none` is not a layer.** A hidden subtree lays out as nothing, and
+written out it filled the file with empty frames: a phone UI with its desktop
+rail hidden carried sixty-four of them, more than a third of the file.
+
+### Several screens in one file
+
+```bash
+npm run rt:fig     # four RealTrainer screens, side by side, in one .fig
+```
+
+`fig_cli pack <out.fig> <w> <h> <in.evg.json>…` puts each document on one page
+as a top-level frame named after its file, which is what a design file of an
+app looks like and what one screen per file is not.
+
+### The archive has four entries, and a reader looks them up by name
+
+```text
+canvas.fig      the document
+thumbnail.png   a picture of it, for the file browser
+meta.json       the background, the thumbnail's size, the region it covers
+images/         the bytes of any image paints
+```
+
+A file with the first two of those imported as:
+
+```text
+format: Figma Zip V2
+TypeError: Cannot read properties of undefined (reading 'getData')
+```
+
+— which is a lookup that found nothing, not a document that was wrong. Figma
+recognised the container, asked for an entry by name and called `getData()` on
+what came back. `FigThumb` writes the missing one: a solid PNG in the
+document's own paper colour, a hundred and twenty-eight points on its long
+side. It is a PLACEHOLDER and says so — the application draws its own
+thumbnail once the file is open — and it is written with stored deflate, so
+the size is the reason it is small: three bytes a pixel whatever is in it.
+
+`meta.json` is shaped like a real export's now (`client_meta` with the
+background colour, the thumbnail's size and the render region), and `images/`
+is present and empty rather than absent.
+
+### The schema is Figma's, not ours
+
+A `.fig` carries its own schema, and Figma reads the file THROUGH it: the names
+in the file are matched against the names in Figma's compiled schema. So a type
+this repository invents is a type Figma cannot map onto anything.
+
+The first UI written from here opened in Figma as **"internal error"**, and the
+reason was in the schema rather than in the document:
+
+| what we declared | what Figma declares |
+| --- | --- |
+| a message called `Node` | `NodeChange` — there is no `Node` |
+| `Vector`, `Color`, `ColorStop`, `ParentIndex`, `Blob` as **messages** | **structs** — a different wire format under the same names |
+| `fontFamily` on a node | no such field; a face is `fontName` (family, style, postscript) |
+| `textAlignHorizontal` as a **string** | the enum `TextAlignHorizontal` |
+| no `phase` on a node | `CREATED` on every one — the file is a list of CHANGES |
+| a message with no `type` | `NODE_CHANGES` |
+
+Nothing here could have caught any of it: both ends of the round trip were
+ours, so a file we wrote and read back agreed with itself perfectly. What
+catches it now is `fixtures/health.fig` — a real export, already in the
+repository — used as the ground truth it always was:
+
+`gallery/figma/src/write/FigSchema.rgr` is a SUBSET OF FIGMA'S OWN SCHEMA,
+copied field for field out of that fixture, and
+`FigTest.testWrittenSchemaMatchesFigma` holds it there: every type and every
+field the writer declares must exist in the fixture with the same kind, the
+same id and the same type. A field added to the writer that Figma does not know
+fails the suite instead of a file someone tries to open.
+
+`FigSample.schema()` is a different thing and stays as it is: it exists to
+exercise the READER, and deliberately carries shapes — arcs, masks, instances,
+per-side strokes — that the writer never emits.
+
+And a field the schema does not declare is not refused, it is DROPPED:
+`KiwiEncode.encodeMessage` walks the schema and skips what it does not know.
+That is how `textAutoResize` and `lineHeight` were written into two files that
+did not contain them. The encoder collects those names now, and `from-evg`
+prints them.
+
+### `sourceType` is why an ellipse survives
+
+`SceneNode.kind` is deliberately small — container, text, image, path — because
+the scene graph is format-agnostic and an EVG renderer does not care whether a
+box was an `ELLIPSE` or a `ROUNDED_RECTANGLE`. Figma does. So a node read from a
+`.fig` keeps the type it had in `sourceType`, and the writer writes that back
+rather than guessing from the kind. Nothing else would put the ellipses back.
+
+### The round trip preserves the picture, never the structure
+
+`fig → scene → fig` does not return the file it started from, and it is not
+meant to. `FigToScene` resolves as it reads: an instance is expanded into the
+nodes it stands for, a mask becomes a group, a stroke that is geometry gets its
+own outline node. The sample goes in as 99 nodes and comes back as 121 — the
+same drawing, differently built. A tool that needs the original structure has to
+keep the original file.
+
+The same applies going the other way, and harder. EVG is a **layout engine** and
+a scene is a set of **placed** things, so `EvgToScene` runs layout first and
+reads the boxes it produced. Flex, grid and flow become coordinates. That is
+what a design tool wants, and it cannot be undone afterwards.
+
+### What the writer cannot carry yet
+
+Reported per node rather than dropped in silence:
+
+| | |
+| --- | --- |
+| **image bytes** | an `IMAGE` paint names a hash whose bytes live in the archive, and `SceneToFig` writes no archive entries. Reading them out works: `to-evg` extracts every image beside the document it writes, under the names the paints already use. |
+| **a gradient's angle** | both ends are written, and the angle is not — Figma orients a gradient with a transform on the paint and a scene records only that it was linear |
+
+Everything else a scene carries — position, size, rotation, fills, strokes,
+corner radius, opacity, clipping, text, its font, **vector outlines and both
+ends of a gradient** — is written.
+
+A gradient survives the editable format too, which it did not at first: EVG
+spells one `gradient-from` / `gradient-to` / `gradient-dir`, none of those were
+in `EVGPatch.patchableNames()`, and a Figma page with a gradient fill arrived in
+the document with nothing where the gradient had been. They are in the set now.
+
+### Outlines are blobs, and the blob is the shape
+
+A `VECTOR` keeps its geometry outside the node, in a commands blob that
+`FigPath` decodes and `FigPathWrite` now encodes — `0x01` moveTo, `0x02` lineTo,
+`0x03` quadTo, `0x04` cubicTo, `0x00` close, coordinates as little-endian f32 in
+node space. Arcs never reach the encoder: `SVGPathParser` turns `A` into cubics
+as it reads, so a branch for it would be unreachable code claiming to handle a
+case the parser already resolved.
+
+Writing the blob was not enough on its own, and the second half is worth
+knowing: **a box is painted by `background-color`, a path by `fill`.** Reading
+the box's field for a path produced a `VECTOR` with perfect geometry and no
+paint — a shape that is there, is the right size, and draws nothing, which
+looks exactly like geometry that failed to write.
+
+### One unit, two scales
+
+EVG counts a colour channel 0..255 and a scene counts it 0..1. Passing the
+numbers straight through wrote `r: 16` where Figma expected `r: 0.0627`, every
+channel clamped to full, and the result was a file that **inspected perfectly
+and rendered as a blank page** — the node tree, the types, the sizes and the
+fill counts were all exactly right. No structural check would have caught it.
+Rendering the file and looking at it did.
+
+## EVG support (used, not extended)
+
+| Feature | EVG support |
+| --- | --- |
+| container | yes — `EVGElement.createDiv()` |
+| absolute position | yes — `position:absolute` + `left` / `top` |
+| width / height | yes |
+| background | yes — `background-color` |
+| opacity | yes |
+| border | yes — `border-width` / `border-color` |
+| corner radius | yes — uniform and 4-value TL TR BR BL |
+| overflow hidden | yes |
+| transform | yes — `rotate` / `scale` / `translate` on the viewport root |
+| text | yes — `createSpan()` + `textContent` |
+| font | yes — family / size / weight; `text-align`; `line-height` |
+| image | yes — `createImg()` + `src` + `object-fit` |
+| SVG path | yes — `createPath()` + `d`; `fill` / `stroke-width` |
+| gradient | yes — 2-stop linear `gradient-from` / `gradient-to` / `gradient-dir`, each end with its own alpha |
+| shadow | read and carried, **not drawn here** — the element takes `shadow-radius` / `shadow-color` / `shadow-offset-x/y` and `EVGHostTree` hands them to a native host, but the display list the browser painter reads never carries them. Counted as not drawn. |
+| flex row/column | yes — Auto Layout only |
+| gap | yes |
+| padding | yes |
+| align-items | yes |
+| justify-content | yes |
+| backdrop blur | yes — `backdrop-filter: blur()` |
+| letter-spacing | baked into the glyph outlines; a warning only when text falls back to a span |
+| dedicated ellipse tag | **no** — emit an SVG path |
+
+Every node is placed at the x/y its file stores, Auto Layout children
+included: a Figma export carries the positions its own layout engine
+settled on, and re-running the layout with other fonts would only drift
+from them. The Auto Layout itself (mode, gap, padding, alignment, hug,
+grow, absolute) is read into the scene graph for anything that wants to
+re-flow. Viewport pan/zoom is one `translate * scale` on a world element
+under the clipping root, not a rewrite of node geometry.
+
+Text paints as the glyph outlines the editor shaped (`derivedTextData`),
+so a file set in Space Grotesk or Inter looks right on a machine without
+either font. Strokes paint from `strokeGeometry`, which already carries
+alignment, per-side weights, caps and dashes; a CSS border is the fallback
+for a file without it. A translucent paint goes into its colour, not into
+the element's opacity, so a bar inside a 15% track stays solid.
+
+The layer keeps saying what its edge is even when the outline paints it.
+Emptying its stroke was how the renderer was kept from drawing a border on
+top of the outline — it is told directly now — and the cost of that was a
+layer that said nothing about its own edge: the pane showed no stroke to
+read and an edit to the border colour moved a number nothing paints. A
+recolour now reaches the outline. A new WEIGHT cannot, since the outline is
+the old weight already drawn and there is nothing here to re-flatten it
+with, so the outline is dropped and the CSS border takes over at the weight
+asked for — a guess at the right weight beats an exact picture of the wrong
+one.
+
+A gradient on a VECTOR keeps the shape and loses the ramp. The display
+list carries a gradient as a box — two colours and a direction on the
+element's rectangle — and a vector is not its rectangle: painted there it
+was a grey square where a rounded pill should be, the shading kept and the
+shape lost, which is the wrong half to keep. A path takes the two ends
+mixed into one colour, stays the shape it is, and says so in the count of
+what could not be drawn.
+
+A gradient keeps its ENDS and its alpha. The display list carries two
+stops, so a gradient authored with more loses what is between them — but
+it was keeping the first two instead of the first and the last, which
+ended a red-amber-green scale at amber. Each end also keeps the alpha of
+its own stop, the way a solid paint does: a gradient is as often a tint as
+a band of colour — a track at 16% red over white, a caption fading out —
+and with the alpha dropped those came out as the full colour, an alignment
+scale in poster red and a white label on a black slab.
+
+An emoji is not an outline. Figma shapes the rest of a string into glyph
+paths and draws a colour emoji as a picture, so the slot it leaves in the
+glyph list carries the code point and the em square that picture goes in.
+Filled in the text's ink — which is what drawing every glyph does — that
+square is a black block, and a table heading came out as "Status ■". The
+square is left out and the code point is drawn as text instead, one span
+per emoji at the box the file gives it, in whatever emoji font the machine
+has. That is the same bargain the pipeline makes for any text the file did
+not shape, and it is the only way to it here: the picture Figma drew is not
+in the file, only the code point is.
+
+An underline comes from the same block as the glyphs. Which characters
+carry one is per-character styling — `textDecoration` on an entry of the
+text's style table — and where the line sits is the font's business, so
+Figma works it out and writes the rectangle into
+`derivedTextData.decorations`. Painted as part of the text's own path, so
+it takes the text's ink and the renderer is taught nothing; a strikethrough
+is the same rectangle higher up. Read the glyphs and not that, and a run
+the designer underlined comes out plain.
+
+A frame paints its stroke over its content, so the outline the stroke
+geometry became is the frame's last child. A section does not: it is the
+board's own furniture, and what is left on it is drawn over its edge. A
+sticker across a section's corner is whole in Figma, and here the section's
+green line was cutting through it.
+
+## Try it
+
+```bash
+npm run figma:test          # kiwi + sample .fig + scene IR + viewer
+npm run figma:web           # static page → gallery/figma/web/standalone/dist
+npm run figma:web:serve     # http://localhost:8010
+npm run figma:inspect       # dump the bundled sample
+npm run figma:bench         # Ranger vs openfig-core (if installed)
+```
+
+The page opens on `fixtures/health.fig`, the Figma export shipped beside
+it. Drop your own `.fig` on it, open one the page can fetch —
+`?file=fixtures/health.fig&page=0&frame=1` — ask for the generated deck
+with `?file=sample`, copy layers in Figma and paste them onto the page
+(⌘V), or:
+
+```bash
+node gallery/figma/bin/fig_cli.js inspect path/to/file.fig
+node gallery/figma/bin/fig_cli.js fields path/to/file.fig 13709:3272
+```
+
+`inspect` prints the node tree; `fields` prints one node's raw kiwi
+fields, which is how a layer that draws wrong is read against what the
+file actually says about it.
+
+## Paste from Figma
+
+A copy in Figma lands on the clipboard as `text/html` carrying two
+base64 spans: `(figmeta)`, a little JSON (`fileKey`, `pasteID`), and
+`(figma)`, the same fig-kiwi bytes a `.fig` keeps in `canvas.fig` — no
+ZIP, and only the copied nodes. `web/standalone/clipboard.mjs` unwraps
+the HTML; the parser reads the bytes as they are. The pasted nodes still
+name the page they came from, which is not in the payload, so the tree
+builder gives them a page called **Pasted**. Images referenced by hash
+are not in the payload and paint as grey boxes.
+
+Every paste writes a report — to the Selected pane, to the console, and
+to `window.__lastPaste` — with what the clipboard carried (types, HTML
+size, base64 size, decoded bytes, the eight-byte prelude, the figmeta)
+and what the engine made of it (nodes, pages, `orphans` / `adopted`,
+draw commands, per-stage milliseconds, warnings). `adopted` below
+`orphans` means layers were read and never drawn; a prelude that is not
+`fig-kiwi` means the base64 decoded to something else. A payload whose
+base64 is not a whole number of four-character groups is rejected as
+truncated rather than decoded short in silence.
+
+The HTML a browser hands over is not the HTML Figma wrote: quotes may
+change and the `<!--` `-->` around each span may arrive as named,
+decimal or hex entities. All of those shapes are parsed, and the smoke
+test pastes each one.
+
+## Instances
+
+An `INSTANCE` carries no children. It names a component by guid and Figma
+draws that component's subtree in its place, so a reader that stops at the
+node draws an empty box wherever a file uses components — which is most
+files. `FigToScene` looks the component up and converts its children under
+the instance's transform.
+
+Where the guid is depends on who wrote the file, and only one of the
+spellings being read is what made a real export come out empty:
+
+| | |
+| --- | --- |
+| `overriddenSymbolID` | an instance swapped for a different component |
+| `symbolData.symbolID` | what a Figma export writes — nested, not on the node |
+| `symbolID` on the node | the REST API, and this repository's sample |
+
+All three are read, in that order, and the order matters: a swap is an
+override of the symbol the instance names, not another spelling of it.
+Read last it never won, and a card that swaps its thumbnail for the "you
+are here" variant of a set drew the placeholder artwork the set lists
+first. Expansion stops at fifteen levels, so a cycle is a warning and not
+a hang.
+
+A picture on something that is not a rectangle is still the picture. An
+image fill made the node an image only where the node was already a
+rectangle, so a FigJam STAMP — the profile photo people drop on a board —
+kept the grey box that stands for a picture nothing can draw, with the
+bytes read and in hand. Anything holding nothing but the fill takes it now;
+a node with children of its own does not, since an image element has
+nowhere to put them.
+
+### Overrides
+
+Everything the designer changed inside an instance — the text above all —
+is stored on the instance as `derivedSymbolData`: one `NodeChange` per
+overridden node, carrying only the fields that differ and a `guidPath`
+naming its node in the component. Reading the component but not these
+leaves every instance showing the component's own placeholder, which is
+what makes a real file read as a blank template: "Title text" wherever
+there should be content.
+
+An override is applied by merging its fields over the component node's own
+and running the ordinary reader on the result, so an overridden node goes
+through the same conversion as any other and nothing is reimplemented per
+field. The node keeps its identity and its place in the tree; a derived
+entry's `guid` and `parentIndex` describe the copy, not the original. The
+component itself is untouched — two instances of it can say different
+things.
+
+The key is the whole path, not the last guid on it. A file made of
+components nests them several deep, and most overrides name a node inside
+a nested instance rather than one of the component's own children, so the
+key has to say which instance it went through: `J/Y` for node `Y` inside
+nested instance `J`. Entries go into one table for the document, keyed by
+where the node sits inside the outermost instance, and a nested expansion
+adds to that table rather than replacing it — an earlier version replaced
+it and placed 115 overrides out of 25,672.
+
+A nested instance carries entries for the same nodes as the one outside it,
+and they say what the COMPONENT laid out rather than what this instance of
+it did. The outer table is the one that describes what is on the board, so
+an inner entry fills in only what the outer does not say. Letting it
+replace the outer entry wholesale is what drew a Stars instance resized to
+112 pixels at the 240 its component is: those inner entries carry no size
+at all, and they were overwriting the three the outer one computed.
+
+A path is spelled in `overrideKey`, not in guids. A component that came
+from a library is copied into the file and re-guided on the way in, so the
+guids an override path names are the library's and not the ones the copy
+carries — every node keeps its old identity in `overrideKey`, and that is
+what the path means. Matching on the node's own guid placed 55 of a real
+board's 1,323 overrides; matching on `overrideKey` places 894. A file
+whose components are its own — the bundled sample, a REST import — has no
+`overrideKey`, so the guid is the fallback and nothing changes for it.
+
+Two lists, not one. `derivedSymbolData` is what Figma computed — the
+shaped glyphs, and the size and transform the instance laid the node out
+at — and `symbolData.symbolOverrides` is what the designer typed. The text
+itself is only in the second, the glyphs only in the first, so both are
+merged over the component node, authored first and derived over it. With
+only the derived half read, a card drew the component's own layout: a
+template card 2,030 pixels tall spilled 4,600 pixels of placeholder down
+the board.
+
+An instance also clips the way its component does. The flag is on the
+component; the instance carries only `frameMaskDisabled`. Without it the
+screenshot inside a tip card ran out of the side of the card.
+
+The diagnostics count them: overrides seen, applied, and the difference.
+Seen above applied means placeholders are still showing because a path
+did not match, which needs a different fix from having no overrides.
+
+## FigJam
+
+A sticky, a shape with text, a connector, a stamp, a table: none of them
+has children. Figma builds the layers itself and a `.jam` ships only what
+it built, in two lists that pair by `guidPath`:
+
+| | |
+| --- | --- |
+| `derivedImmutableFrameData.overrides` | the geometry — per layer, its size, transform, flattened fill and stroke paths, and the shaped glyphs of its text |
+| `nodeGenerationData.overrides` | the style for the same layers — paints, the text itself, font, alignment, `visible` |
+
+Read neither and a board opens as a page of empty boxes, which is what a
+`.jam` did here: every one of its 26 stickies, 56 shapes, 5 connectors and
+5 tables drew nothing at all.
+
+Each layer is merged the way an instance override is — style, then
+geometry over it — and run through the ordinary reader, so a sticky's body
+is a vector, its text is text with glyph outlines, and nothing is
+reimplemented per field. The layer's kind is read off the fields it has:
+text data makes it text, a flattened path makes it a vector, and neither
+makes it the box the others sit in — whose own paints belong to them, not
+to it. A sticky's author name is a layer like any other, and it is hidden
+because the file says `visible: false` on it.
+
+The first guid on a path names the layer, and the rest name the node
+inside the frame. A table cell's background and its text therefore share a
+path *tail* and not a prefix — `40000000:0/601:5/601:7` and
+`40000000:1/601:5/601:7` — so a layer is placed against the first entry
+with the same tail. That is what puts the third cell's text in the third
+cell rather than 20 pixels from the table's corner.
+
+A table does not repeat what every cell has in common. It ships two more
+style blocks, each keyed by a layer guid with no geometry of its own: the
+cell — white, with the 20% black rule that IS the grid — and the cell's
+text, with its font and its ink. A per-cell entry then carries only what
+differs, so read on their own those entries name a font and no colour at
+all, and five tables drew as grey slabs with nothing written in them.
+Which block is which is what it carries, not where it sits: the one with
+text in it is the text. And which layers want which is the LAYER's, not
+the entry's — every `40000000:1/…` in a table is the text of some cell, so
+a cell that says nothing still takes the text default rather than being
+painted white as a box.
+
+A connector ships three layers — the line, and the text and rounded box
+its label is made of — and one style block, which is the line's: its caps
+and its arrow head are drawn in it, the head as a filled path in the line's
+colour, the only colour the file gives it. The label layers are styled only
+when there is a label, so a connector without one carries a 100x100 box
+nothing says how to paint. Reading that block as the whole connector's
+painted the box too, and every divider drawn with a connector came out with
+a coloured square sitting on one end of it.
+
+A FIG FILE SPELLS THE WINDING RULE "ODD". The enum in the schema has two
+members, `NONZERO` and `ODD`, and the reader tested for `EVENODD` — the CSS
+and SVG spelling — so it never matched and every even-odd path was filled
+non-zero. An outline shape is a ring, and filled that way it swallows its
+own hole: a hand icon in a tip card came out as a black blob, and the board
+this was found on has 171 paths that ask for the rule. Both spellings are
+taken now, so a REST import reads the same.
+
+A turn, one factor and a mirror is all a matrix here can say, and it is all
+the renderer applies. A matrix that is anything else — a skew, or a scale
+that differs by axis — is drawn as the NEAREST TURN, which is a different
+picture and not a soft one, so it is counted rather than left to be puzzled
+over. `SceneMatrix.isSimilarity` is the test: two columns of the same
+length, at right angles. The tolerance is an angle — a hundredth of the
+cosine, about half a degree — because a rotation written to seven places
+has a dot product of a few thousandths and is not a skew.
+
+What a picture does INSIDE its box is the paint's business and not the
+node's. Figma keeps a turn and a matrix on an image fill — where the
+picture is cropped and panned within the shape — and neither is the node's
+transform. The list draws a picture upright and whole into the element's
+box, so a photo that should be a detail of itself comes out as the whole
+frame. Both are counted, and the Selection debug says which one a layer
+has.
+
+A mirrored layer is a mirror, not a turn. Figma writes one as a matrix
+whose determinant is negative — handedness reversed, which no angle can do
+— and `rotationDeg` answers an angle for it happily: an arrow drawn that
+way came out backwards, its head where its tail belongs. What is left once
+the mirror is taken out IS that angle, since `M = R(theta) · diag(1, -1)`,
+so the flip is written beside it and `EVGElement` carries it as one: two
+scale arguments of the same magnitude and opposite sign are a similarity
+still — a turn, a factor and a flip — where two of different magnitudes are
+the non-uniform scale the display list refuses.
+
+A clip inside a turn is not a clip. It crosses the display list as x/y/w/h
+and every backend makes it a scissor, which is axis-aligned; the rotation
+that moves the pixels cannot move the rectangle with them, so the two end
+up describing different places. Applied anyway, a turned frame clips away
+the very thing it contains — a quarter-turned arrow on a board drew nothing
+at all, its content sent a hundred pixels above a scissor that stayed where
+the layout put it. `EVGDisplayList` drops the clip instead, which is the
+same choice it already makes for culling under a rotation: content that
+overflows a turned frame is drawn rather than cut in the wrong place.
+Anything better needs a stencil, and that is a list format every backend
+would have to follow.
+
+## Moving around
+
+Drag with any button to pan, scroll to zoom, pinch with two fingers, or use
+the `−` / `+` buttons; the readout between them shows the zoom and is the
+button that returns to 100%. Zoom is anchored on the pointer — or on the
+midpoint of the two fingers — so the point under it stays where it is
+instead of the page sliding toward the origin. A trackpad pinch arrives as
+a wheel with `ctrl` held and gets a rate of its own, or it would crawl where
+the wheel flies; a finger lifted out of a pinch leaves the other one
+panning. The gestures are `lib/evg/gl/evg-gestures.js`, which any EVG
+canvas can attach — it reads the view this page keeps and hands back
+another, and the page still decides when to paint one.
+
+Input is applied once per animation frame, not once per event. Both
+`setView` and `draw` are expensive — the first rebuilds the display list
+in Ranger, the second serialises the whole scene to JSON and back — and a
+wheel flick arrives far faster than a frame, so applying each event as it
+landed made the queue grow while the same work was redone. Forty wheel
+events in one task now cost one rebuild and one paint.
+
+Wheel deltas are normalised before use: Firefox reports lines and Chrome
+pixels, one notch arriving as 3 or as 100, and a line is counted as 33
+pixels so that a notch is 1.16x in both.
+
+The pan is a transform, and EVG skips a subtree that cannot reach the clip
+it is inside — a check that was made against the boxes the layout placed,
+while the transform moves the pixels afterwards. A Figma page is laid out
+around the origin and never noticed; a FigJam board is laid out where the
+designer left it, x = -13,264 here, so every frame on it measured as ten
+thousand pixels off-screen and was skipped whole: 193 draw commands for
+3,565 nodes. The clip now travels into the space the subtree is laid out
+in (`EVGDisplayList.cullThroughTransform`), so the same board draws 1,704
+of them and still skips what is really off-screen.
+
+## Layers
+
+The pane on the left is a tree rooted at ONE layer at a time, not a list of
+every layer in the file: a board is thousands of them, and all of them at
+once is a wall rather than a tree. Picking something on the canvas roots the
+pane where you picked — at the layer, or at its parent when the layer has
+nothing under it, since the siblings of a leaf are the useful thing to see
+and a pane holding one row is not. The crumbs above say where that is and
+climb back out, and `⤵` on a row roots the pane there.
+
+Rows are open by default; a fold you have to click through to see anything
+is a list with extra steps. What folds itself is what does not fit: the pane
+draws about six hundred rows, and a subtree bigger than the room left
+arrives folded with its size in the tooltip. The room left counts the rows
+still owed to everything queued behind it, so every section of a board gets
+a row even when the first one could have filled the pane on its own. A layer
+you open by hand stays open.
+
+## Selecting and editing
+
+Click a layer on the canvas or in the tree and it is ringed on the page and
+opened in the right-hand pane. The ring is drawn around the layer's box on
+the page, which has to be walked to: `x`/`y` on a node is an offset from
+its parent, so a title twenty pixels into a card three thousand pixels
+across the board is not at 20,16 — where the ring used to be drawn, in the
+corner of the page and nowhere near what it was pointing at.
+
+**What the click lands on.** Three things decide it, and each of them used
+to pick the wrong layer. The point travels into each layer's own space on
+the way down, the same way the renderer moves the pixels — a rotated layer
+was being tested against its unrotated box, so it answered for the space
+beside it and the more it was turned the further away you had to click. A
+child is looked at whether or not its parent's box holds the point; only a
+layer that CLIPS can keep its children from being picked, where gating the
+walk on the parent made anything hanging out of its frame unselectable and
+a group whose own box is empty — which a FigJam frame often is — hid
+everything inside it. And what draws wins over what does not, the deeper of
+two wins, and between two of the same rank the one painted later does: the
+walk used to answer with whatever container it happened to be inside last.
+The stroke outline this reader emits to paint a layer's own stroke is not a
+layer anyone drew, so it is not offered — it sits under the layer it
+belongs to and was answering for the one beside it.
+
+The ring follows the same walk, so a turned layer gets the box that
+contains it rather than one hanging in the air beside it. The ring itself
+stays square: the display list draws axis-aligned frames.
+
+The pane is not a list of facts about the layer. The numbers on it ARE the
+layer: type one and the page is painted again. Figma answers this with a
+grid of boxes; here only what you can change looks like a field and
+everything else is text, and a field's label is a scrub handle — drag it
+sideways and the number follows. Position and size, opacity, corner radius,
+fill and stroke colour, and the text itself are editable; Auto Layout, the
+effects and what the reader could not draw are shown and not.
+
+Retyping a text layer drops the glyph outlines the editor shaped with it —
+those outlines are the old string, drawn — and what replaces them is the
+text laid out here, in whatever font this machine has. That is the honest
+result, and it says plainly which half of the pipeline drew what you are
+looking at.
+
+Nothing is written back to the file. **Revert edits** re-reads the document
+the scene was converted from.
+
+The **Frame** control picks a frame by its index, which is what the viewer
+takes and reads back. It used to list the frames' ids: no option ever
+matched the index put into it, so the control showed blank on every file,
+and picking one asked for frame 13,709 — out of range, which quietly showed
+the whole page again.
+
+## What a frame costs
+
+A board of 3,565 nodes, panned. Measured on this file, per frame:
+
+| | before | after |
+| --- | --- | --- |
+| build the display list | 1,702 ms | 37 ms |
+| decode it in the page | — | 9 ms |
+| paint it | 71 ms | 41 ms |
+| hand the frame over (JSON) | 5,630 ms | gone |
+
+A frame of that board carried 2.5 million points; it carries 767,000 now,
+and `fixtures/health.fig` — three phone screens, the size of file anyone
+actually opens — went from 27 ms a frame to 12.
+
+**The frame crosses as typed arrays.** `EVGDisplayList.toBinary()` — three
+`Int32Array`s and a small string pool — instead of JSON. The picture is the
+same to the hundredth, which is what `lib/evg/gl/list-binary-check.mjs`
+holds the two bridges to, and `scene()` still answers in JSON for anything
+that wants to read a frame. Writing it as text was 42% of a profile in
+`toJson` and the number formatting under it, and another 33% in the garbage
+they made.
+
+**The EVG tree is dumped when someone asks for it.** The debug pane's text
+is twelve megabytes on this board, and it was built on every rebuild — so
+on every frame of a pan — and thrown away unread.
+
+**Pan and zoom move the pixels, not the boxes.** The transform is one
+attribute on the world element; the tree under it and its layout do not
+change, so a view change writes that attribute and walks the tree again
+rather than building a second tree and laying it out.
+
+**A flattened outline is kept.** `d` is a string and the painter wants
+points, so the walk parses and flattens every path — and a page of text
+drawn as glyph outlines is thousands of them. The result depends on the
+path and on the box it is drawn in, neither of which a pan changes, so
+`EVGElement` keeps it (`ringsCache`) and re-flattens when either changes:
+966 → 581 ms.
+
+**And a curve is flattened for the size it is DRAWN at.** The subdivision
+was chosen from the layout box, and a transform is exactly the difference
+between that box and the pixels: this board at 10% was cutting every glyph
+into the 48 segments a curve 640 layout pixels wide deserves, to draw it
+five pixels long. The scale of the transforms a subtree is under is
+carried down the walk (`drawScale`), so the count follows the pixels:
+581 → 125 ms.
+
+**A curve is also cut by its own length, not by the box it lives in.**
+Inside a path the element's size says nothing: a heading 2,855 pixels wide
+cut every curve of every glyph in it 47 ways in order to draw those glyphs
+two pixels tall. Each curve is measured through the transform and cut at
+about a point every two device pixels, never finer than the ceiling above
+— so nothing is heavier than it was, and a big curve keeps every segment
+it had. 125 → 37 ms. All three of these are the engine's own gain: any EVG
+page with vectors on it redraws for less.
+
+What is left is the frame itself: 37 ms to build the list, 9 to decode it,
+18 to build the GPU buffers and 18 to draw. The first three of those are
+work a pan does not need — the scene has not changed, only the camera has —
+and taking the camera out of the coordinates is designed in
+[`../../lib/evg/PLAN_VIEW_TRANSFORM.md`](../../lib/evg/PLAN_VIEW_TRANSFORM.md), which
+would put a pan of this board at the draw alone.
+
+## Selection debug
+
+**Selection debug** in the Selected pane prints everything about ONE layer
+to the console — and to the clipboard, and to `window.__selectionDebug`.
+The reports below answer for a whole file, which is where to start when you
+do not know what is wrong; this is for when you are pointing at the thing.
+
+It reads the layer AND the node it came from, because most of what goes
+wrong is the difference between the two: where the layer sits, named from
+the page down; what it puts on the canvas, paint by paint, with the alpha
+folded in and a paint the file switches off marked as off; whether its text
+carries the glyphs the editor shaped or is being laid out here in whatever
+font this machine has, which is where a box or a tofu square comes from;
+whether an image's bytes are in the file; whether an instance's component
+is; what the reader could not draw; and, for a colour left to a named
+style, whether that style is in the file at all — a layer that carries no
+paint of its own and names a style the file does not have is a colour
+nothing can recover, which is a different problem from one being drawn
+wrong. Last, the fields this node carries that the converter never looks
+at, with the plain-language note where there is one.
+
+## When the page looks wrong and nothing is reported
+
+A warning can only name a case someone thought of, so when a page comes
+out unlike Figma and the unsupported count is zero, what is missing is by
+definition what nobody wrote a warning for. The **draw nothing** link in
+the footer asks it the other way round and shows two things.
+
+**The scene by node type**, and how many nodes of each type put nothing on
+the canvas — no fill, stroke, path, image or text, and no children either.
+A type whose nodes mostly draw nothing is where the content is being lost,
+and it names a type rather than a layer, which is what makes it worth
+counting. Image fills whose bytes are not in the file are counted too;
+those paint as grey boxes.
+
+**Fields this file carries that the reader never looks at.** Every field
+the decoder found, minus the ones the converter reads, counted across the
+file with an example layer. The ones known to change what you see are
+named in plain language and sorted first — masks, blend modes, per-
+character text styling, arcs, dash patterns — and the rest are listed by
+name, because the useful one is often the one nobody has thought about
+yet. `gallery/figma/src/FigFieldReport.rgr` holds both the list of fields
+the converter reads and the notes.
+
+## When something does not draw
+
+The footer counts what the reader could not draw, and the count is a link
+that lists the layers by id and name. Nothing is printed per node — a file
+whose components are everywhere produces one warning per instance, and a
+console line each would bury the file being read. What the categories mean:
+
+| warning | what you see |
+| --- | --- |
+| `instance names a component that is not in the file` | an empty box — the component is in a library this file does not carry |
+| `instance names a component with no children, and has nothing of its own to draw` | an empty box — and only reported when the instance really draws nothing; an instance of a single-shape component is normal and silent |
+| `instance whose symbolData names no component` | an empty box — the block is there and holds no guid |
+| `instance with only derived data (overrides), which is not read yet` | an empty box — the content is in `derivedSymbolData` and nothing else |
+| `instance with no symbol fields at all` | an empty box — the node names nothing |
+| `instances nested more than 15 deep` | the outer instances draw, the innermost do not |
+| `boolean operation without geometry` | the shape is missing; Figma did not export a flattened path for it |
+| `strokeAlign OUTSIDE` / `per-side stroke weights` | the stroke is drawn, in the wrong place or at one weight — reported only when the file did not bring `strokeGeometry`, since with it the stroke is exact |
+| `letterSpacing` | the text draws, tracking ignored |
+
+## What it draws
+
+| Figma | SceneNode | EVG |
+| --- | --- | --- |
+| `CANVAS` / `PAGE` | container (page), `backgroundColor` | viewport background + children |
+| `FRAME` / `GROUP` / `SECTION` | container | `div` |
+| `COMPONENT` / `INSTANCE` | container (resolved children) | `div` |
+| `RECTANGLE` | rect | `div` + background |
+| `ELLIPSE` | ellipse | `path` |
+| `LINE` | line | `path` |
+| `VECTOR` / `STAR` / `POLYGON` | path | `path` `d="…"` |
+| `TEXT` | text (+ glyph outlines) | `path`, or `span` without outlines |
+| image fill | image | `img` |
+| stroke with `strokeGeometry` | child path in the stroke colour | `path` |
+| `STICKY` / `SHAPE_WITH_TEXT` | container + the layers the file built | `path` + `path` |
+| `CONNECTOR` | container + line, cap and label layers | `path` + `path` |
+| `TABLE` | container + a layer per cell background and cell text | `path` + `path` |
+
+Also: local coordinates, opacity, visibility, solid / linear-gradient /
+image fills, strokes, corner radius, clipping, drop shadow, basic text
+styles, Auto Layout (row/column, gap, padding, align), nested hierarchy.
+
+Out of scope for this version: prototype interactions, component properties,
+variables, advanced effects, masks (logged, not fatal).
+
+Unsupported features print:
+
+```text
+[figma-viewer] Unsupported letterSpacing (EVG has no letter-spacing) node: 1:3 "Title"
+```
+
+and the rest of the document still paints.
+
+## Sample fixtures
+
+The bundled sample has three pages: **Welcome**, **Palette**, and
+**Fixtures**. Fixtures are one named frame per feature:
+
+`01-basic-rect` … `15-gradient`, plus a line, a component and an instance.
+
+`fixtures/health.fig` is a real Figma export: three phone screens built
+with Auto Layout, text in Space Grotesk and Inter, an image, stroke-only
+chart vectors and a background blur on the tab bars. `figma:test` and
+`figma:web:test` both open it.
+
+Same Figma bytes → same Scene JSON → same EVG dump.
+
+## Benchmark
+
+`npm run figma:bench` writes `gallery/figma/bench/out/last.json`.
+
+Install `openfig-core` in the repo (or globally) to fill the OpenFig column.
+The sample is stored-deflate so both sides skip zstd; a Figma export hits
+zstd + a ~550-type schema on both.
+
+## Layout
+
+```text
+gallery/figma/
+  src/FigParser.rgr          ZIP → canvas → kiwi → FigDoc
+  src/FigModel.rgr           typed Figma nodes
+  src/convert/FigToScene.rgr Figma → SceneNode
+  src/scene/                 format-agnostic IR + matrices + assets
+  src/evg/SceneToEVG.rgr     SceneNode → EVGElement
+  src/FigApp.rgr             viewer: pages, frames, pan/zoom, debug
+  src/FigToEvg.rgr           leftover direct painter (unused by the viewer)
+  tests/                     FigTest
+  web/                       FigWeb + github.io page (+ clipboard.mjs)
+  bench/                     Ranger vs openfig-core
+  fixtures/                  sample.fig (generated), health.fig (Figma export)
+```
+
+**License: AGPL-3.0-or-later** (this directory is under `gallery/`), with
+no third-party code left in it.

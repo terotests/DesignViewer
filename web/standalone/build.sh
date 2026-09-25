@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Build the serverless Fig viewer.
+#
+#   npm run figma:web                -> gallery/figma/web/standalone/dist
+#   npm run figma:web -- --out DIR
+set -e
+cd "$(dirname "$0")/../../../.."
+ROOT="$(pwd)"
+WEB=gallery/figma/web/standalone
+OUT="$WEB/dist"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out) OUT="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+export RANGER_LIB=./compiler/Lang.rgr:./lib/stdops.rgr
+
+STAGE=$WEB/dist
+mkdir -p "$STAGE" "$OUT"
+rm -f "$STAGE/fig_web.js"
+
+log=$(node dist/rgrc.js -es6 gallery/figma/web/fig_web.rgr -d="$STAGE" -o=fig_web.js 2>&1)
+if echo "$log" | grep -q "Compilation FAILED"; then
+  echo "$log" | grep -A3 "\[FAIL\]" | head -40
+  echo "FAILED to compile gallery/figma/web/fig_web.rgr" >&2
+  exit 1
+fi
+if [ ! -f "$STAGE/fig_web.js" ]; then
+  echo "the compiler reported no failure but wrote no $STAGE/fig_web.js" >&2
+  exit 1
+fi
+
+node --input-type=module -e "
+  import fs from 'fs';
+  globalThis.require = undefined;
+  const src = fs.readFileSync('$STAGE/fig_web.js', 'utf8');
+  const found = (0, eval)(src + '; typeof FigWeb');
+  if (found !== 'function') {
+    console.error('fig_web.js does not define FigWeb when loaded without require()');
+    process.exit(1);
+  }
+" || exit 1
+
+node --input-type=module -e "
+  import fs from 'fs';
+  const p = '$STAGE/fig_web.js';
+  const src = fs.readFileSync(p, 'utf8');
+  if (!src.startsWith('// scoped')) {
+    fs.writeFileSync(p,
+      '// scoped: the page loads this beside other scripts, so it publishes one name.\\n'
+      + '(function () {\\n' + src + '\\n;globalThis.FigWeb = FigWeb;\\n})();\\n');
+  }
+" || exit 1
+
+if [ "$(cd "$OUT" && pwd)" != "$(cd "$STAGE" && pwd)" ]; then
+  mkdir -p "$OUT"
+  cp "$STAGE/fig_web.js" "$OUT/fig_web.js"
+fi
+
+cp "$WEB/index.html" "$OUT/index.html"
+# The page links this; without it the browser falls back to /favicon.ico at
+# the origin root and logs a 404 the page cannot answer for.
+cp playground/public/favicon.svg "$OUT/favicon.svg"
+cp "$WEB/standalone.mjs" "$OUT/standalone.mjs"
+cp "$WEB/clipboard.mjs" "$OUT/clipboard.mjs"
+mkdir -p "$OUT/gl" "$OUT/fonts"
+mkdir -p "$OUT/fixtures"
+cp gallery/figma/fixtures/*.fig "$OUT/fixtures/"
+cp lib/evg/gl/evg-webgl.js "$OUT/gl/evg-webgl.js"
+cp lib/evg/gl/evg-binary.js "$OUT/gl/evg-binary.js"
+cp lib/evg/gl/evg-gestures.js "$OUT/gl/evg-gestures.js"
+cp lib/evg/gl/evg-view.js "$OUT/gl/evg-view.js"
+# The module half of the head this build writes, shared with every other
+# gallery page: it picks up the responses the head started.
+mkdir -p "$OUT/evg"
+cp lib/evg/web/tools/assets-client.mjs "$OUT/evg/assets-client.mjs"
+for face in OpenSans-Regular OpenSans-Bold OpenSans-Italic OpenSans-BoldItalic; do
+  cp "gallery/pdf_writer/assets/fonts/Open_Sans/$face.ttf" "$OUT/fonts/$face.ttf"
+done
+
+STAMP=$(node -e "
+  const fs = require('fs'), crypto = require('crypto');
+  const h = crypto.createHash('sha1');
+  for (const f of ['$OUT/fig_web.js', '$OUT/standalone.mjs', '$OUT/gl/evg-webgl.js', '$OUT/gl/evg-binary.js', '$OUT/gl/evg-gestures.js', '$OUT/gl/evg-view.js']) h.update(fs.readFileSync(f));
+  process.stdout.write(h.digest('hex').slice(0, 10));
+")
+node -e "
+  const fs = require('fs');
+  const stamp = '$STAMP';
+  fs.writeFileSync('$OUT/index.html',
+    fs.readFileSync('$OUT/index.html', 'utf8').split('__BUILD__').join(stamp));
+" || exit 1
+# Minified when there is a minifier, and a head that starts the file the page
+# opens on. `?file=` names another one and is not started here: it is an
+# arbitrary path, and the module fetches it as it always did.
+node lib/evg/web/tools/minify.mjs --file "$OUT/fig_web.js" --keep FigWeb || exit 1
+node lib/evg/web/tools/inline-assets.mjs \
+  --html "$OUT/index.html" \
+  --start "fixtures/health.fig" \
+  --preload-stamped "standalone.mjs" \
+  --preload "gl/evg-webgl.js,gl/evg-binary.js,gl/evg-gestures.js,gl/evg-view.js,evg/assets-client.mjs" \
+  --stamp "$STAMP" || exit 1
+
+if grep -q "__BUILD__" "$OUT/index.html"; then
+  echo "the build stamp was not written into $OUT/index.html" >&2
+  exit 1
+fi
+
+printf '  %s\n' "$OUT/index.html" "$OUT/fig_web.js" "$OUT/standalone.mjs"
+echo "build $STAMP"
+echo "open it with:  python3 -m http.server -d $OUT 8010"

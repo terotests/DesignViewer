@@ -1,0 +1,110 @@
+# Build the Figma viewer and deploy it to GitHub Pages
+# (https://terotests.github.io/DesignViewer/).
+#
+# DesignViewer is Ranger source. The compiler (dist/rgrc.js) is committed in
+# the Ranger repository, so no `npm ci` and no compiler build is needed: a
+# sparse, shallow checkout of the parts the build reads is enough, and this
+# repository is placed at gallery/figma inside it, where the scripts expect
+# to be.
+name: Deploy DesignViewer to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ranger_ref:
+        description: "Ranger branch, tag or commit to build with"
+        required: false
+        default: ""
+
+env:
+  RANGER_REF: ${{ inputs.ranger_ref || 'master' }}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Ranger (compiler + libraries)
+        uses: actions/checkout@v4
+        with:
+          repository: terotests/Ranger
+          ref: ${{ env.RANGER_REF }}
+          path: ranger
+          fetch-depth: 1
+          sparse-checkout: |
+            compiler
+            lib
+            dist
+            scripts/rgr-suite.sh
+            gallery/zip
+            gallery/zstd
+            gallery/game_engine/v2/tests/harness
+            gallery/pdf_writer/assets/fonts/Open_Sans
+            playground/public/favicon.svg
+
+      # Ranger still carries its own copy at gallery/figma; this repository
+      # replaces it.
+      - name: Remove Ranger's gallery/figma
+        run: rm -rf ranger/gallery/figma
+
+      - name: Checkout DesignViewer
+        uses: actions/checkout@v4
+        with:
+          path: ranger/gallery/figma
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test
+        working-directory: ranger
+        run: bash scripts/rgr-suite.sh ./gallery/figma/tests/FigTest.rgr ./gallery/figma/bin FigTest.js
+
+      - name: Build the viewer
+        working-directory: ranger
+        run: bash gallery/figma/web/standalone/build.sh --out "$GITHUB_WORKSPACE/_site"
+
+      - name: Check the bundle
+        run: |
+          test -s _site/fig_web.js
+          test -s _site/standalone.mjs
+          test -s _site/gl/evg-webgl.js
+          test -s _site/fixtures/health.fig
+          grep -q "FigWeb" _site/fig_web.js
+
+      # The build leaves web/standalone/dist in place, which is what the
+      # smoke test loads: health.fig end to end and the clipboard path.
+      - name: Smoke test the bundle
+        working-directory: ranger
+        run: node gallery/figma/web/standalone/smoke.mjs
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

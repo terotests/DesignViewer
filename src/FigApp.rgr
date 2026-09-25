@@ -1,0 +1,2061 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; Viewer: Figma bytes → SceneDocument → EVGElement → display list.
+; Viewport pan/zoom is a root EVG transform. Painting never reads FigNode.
+
+Import "FigParser.rgr"
+Import "FigSample.rgr"
+Import "KiwiValue.rgr"
+Import "FigFieldReport.rgr"
+Import "convert/FigToScene.rgr"
+Import "evg/SceneToEVG.rgr"
+Import "scene/SceneNode.rgr"
+Import "scene/SceneAssets.rgr"
+Import "pkg:evg/EVGElement.rgr"
+Import "pkg:evg/EVGLayout.rgr"
+Import "pkg:evg/EVGDisplayList.rgr"
+Import "pkg:evg/EVGColor.rgr"
+
+class FigApp {
+    def parser:FigParser (new FigParser())
+    def converter:FigToScene (new FigToScene())
+    def emitter:SceneToEVG (new SceneToEVG())
+    def assets:SceneAssets (new SceneAssets())
+    def doc:FigDoc (new FigDoc())
+    def sceneDoc:SceneDocument (new SceneDocument())
+    def evgRoot:EVGElement (EVGElement.createDiv())
+    def list:EVGDisplayList (new EVGDisplayList())
+    def evgDump:string ""
+    ; The EVG tree as text is for the debug pane and the tests, and on a real
+    ; board it is twelve megabytes of it. Built on every rebuild — so on
+    ; every frame of a pan — it was most of what a pan cost and all of it was
+    ; thrown away unread. Built when someone asks for it now.
+    def dumpStale:boolean true
+    ; The tree in `evgRoot` has been laid out at the current page size and
+    ; matches the current scene. False until the first build, and whenever
+    ; anything under the view changes.
+    def laidOut:boolean false
+    def layout:EVGLayout (new EVGLayout())
+    def pageIndex:int 0
+    def frameIndex:int (0 - 1)
+    def selected:string ""
+    def name:string ""
+    def ok:boolean false
+    def err:string ""
+    def panX:double 40.0
+    def panY:double 40.0
+    def zoom:double 1.0
+    ; THE VIEW AS A CAMERA rather than as a transform on the world element.
+    ;
+    ; With it off — which is what every caller had — a pan writes the
+    ; transform and walks the tree again: 3,565 nodes, every path flattened,
+    ; 37 ms before the page has seen anything. With it on the list is in
+    ; SCENE coordinates and carries the camera beside it, so a pan is three
+    ; numbers and the painter's uniform, and the walk happens only when the
+    ; view leaves the region the list was built for. See
+    ; lib/evg/PLAN_VIEW_TRANSFORM.md and gl/evg-view.js, which is where
+    ; the host's keep-or-build arithmetic lives.
+    def camera:boolean false
+    ; How far past the viewport to build, in viewports. One each way is nine
+    ; times the area at worst and much less in practice — a board at 8x has
+    ; almost nothing on it — and it is what a pan spends before a rebuild.
+    def overscan:double 1.0
+    def debug:boolean false
+    def cmdCount:int 0
+    ; What the hit walk found, and how good a match it was.
+    def hitId:string ""
+    def hitScore:int 0
+    def pageW:double 1200.0
+    def pageH:double 800.0
+
+    Constructor () {
+        evgRoot = (EVGElement.createDiv())
+    }
+
+    fn openBytes:boolean (bytes:buffer fileName:string) {
+        name = fileName
+        doc = (parser.parseBytes(bytes fileName))
+        ok = doc.ok
+        err = doc.err
+        pageIndex = 0
+        frameIndex = (0 - 1)
+        selected = ""
+        if ok {
+            this.convert()
+            this.fit()
+            this.rebuild()
+        }
+        return ok
+    }
+
+    fn openSample:boolean () {
+        return (this.openBytes((FigSample.buildFig()) "sample.fig"))
+    }
+
+    fn openClipboardSample:boolean () {
+        return (this.openBytes((FigSample.buildClipboard()) "clipboard"))
+    }
+
+    fn convert:void () {
+        laidOut = false
+        sceneDoc = (converter.convertDoc(doc))
+        assets = (new SceneAssets())
+        def i:int 0
+        while (i < (array_length doc.images)) {
+            def im:FigImage (itemAt doc.images i)
+            assets.setImage(im.name im.name)
+            i = (i + 1)
+        }
+        emitter.setAssets(assets)
+    }
+
+    fn pageCount:int () {
+        return (array_length sceneDoc.pages)
+    }
+
+    fn currentPage:SceneNode () {
+        return (sceneDoc.pageAt(pageIndex))
+    }
+
+    fn framesOnPage:[SceneNode] () {
+        def page:SceneNode (this.currentPage())
+        def out:[SceneNode]
+        def i:int 0
+        while (i < (array_length page.children)) {
+            def ch:SceneNode (itemAt page.children i)
+            if (ch.isFrameLike()) {
+                push out ch
+            }
+            i = (i + 1)
+        }
+        return out
+    }
+
+    fn setPage:void (i:int) {
+        def n:int (this.pageCount())
+        if (n <= 0) {
+            return
+        }
+        if (i < 0) {
+            i = 0
+        }
+        if (i >= n) {
+            i = (n - 1)
+        }
+        pageIndex = i
+        frameIndex = (0 - 1)
+        selected = ""
+        laidOut = false
+        this.fit()
+        this.rebuild()
+    }
+
+    fn setFrame:void (i:int) {
+        frameIndex = i
+        selected = ""
+        laidOut = false
+        this.fit()
+        this.rebuild()
+    }
+
+    ; The ring is a command on top of the same tree.
+    fn select:void (id:string) {
+        selected = id
+        this.repaint()
+    }
+
+    fn setDebug:void (on:boolean) {
+        debug = on
+        emitter.setDebug(on)
+        laidOut = false
+        this.rebuild()
+    }
+
+    fn setImageUrl:void (ref:string url:string) {
+        assets.setImage(ref url)
+        emitter.setAssets(assets)
+        laidOut = false
+        this.rebuild()
+    }
+
+    fn viewRoot:SceneNode () {
+        def page:SceneNode (this.currentPage())
+        if (frameIndex < 0) {
+            return page
+        }
+        def frames:[SceneNode] (this.framesOnPage())
+        if (frameIndex >= (array_length frames)) {
+            return page
+        }
+        return (itemAt frames frameIndex)
+    }
+
+    ; What the view root covers. A page has no size of its own — its
+    ; frames sit wherever they were drawn — so a page is measured as the
+    ; union of its children, and fit/100% pan to that rather than to 0,0.
+    fn contentBox:SceneNode (target:SceneNode) {
+        def box (new SceneNode())
+        box.x = target.x
+        box.y = target.y
+        box.w = target.w
+        box.h = target.h
+        if ((target.sourceType != "CANVAS") && (target.w >= 1.0)) {
+            return box
+        }
+        def n:int (array_length target.children)
+        if (n == 0) {
+            box.w = 800.0
+            box.h = 600.0
+            return box
+        }
+        def minX:double 0.0
+        def minY:double 0.0
+        def maxX:double 0.0
+        def maxY:double 0.0
+        def i:int 0
+        while (i < n) {
+            def ch:SceneNode (itemAt target.children i)
+            if ((i == 0) || (ch.x < minX)) {
+                minX = ch.x
+            }
+            if ((i == 0) || (ch.y < minY)) {
+                minY = ch.y
+            }
+            if ((i == 0) || ((ch.x + ch.w) > maxX)) {
+                maxX = (ch.x + ch.w)
+            }
+            if ((i == 0) || ((ch.y + ch.h) > maxY)) {
+                maxY = (ch.y + ch.h)
+            }
+            i = (i + 1)
+        }
+        box.x = minX
+        box.y = minY
+        box.w = (maxX - minX)
+        box.h = (maxY - minY)
+        return box
+    }
+
+    ; The canvas size in CSS pixels. The display list is built at this size,
+    ; so the host paints it one to one; before this it was always 1200x800
+    ; and stretched to whatever the canvas was, which squashed every frame.
+    fn setViewport:void (w:double h:double) {
+        if ((w < 1.0) || (h < 1.0)) {
+            return
+        }
+        if ((w == pageW) && (h == pageH)) {
+            return
+        }
+        pageW = w
+        pageH = h
+        laidOut = false
+        this.rebuild()
+    }
+
+    fn fit:void () {
+        def target:SceneNode (this.contentBox((this.viewRoot())))
+        def w:double target.w
+        def h:double target.h
+        def ox:double target.x
+        def oy:double target.y
+        if (w < 1.0) {
+            w = 800.0
+        }
+        if (h < 1.0) {
+            h = 600.0
+        }
+        def sx:double ((pageW - 80.0) / w)
+        def sy:double ((pageH - 80.0) / h)
+        def sc:double sx
+        if (sy < sc) {
+            sc = sy
+        }
+        if (sc > 1.5) {
+            sc = 1.5
+        }
+        if (sc < 0.1) {
+            sc = 0.1
+        }
+        zoom = sc
+        panX = (40.0 - (ox * zoom))
+        panY = (40.0 - (oy * zoom))
+    }
+
+    fn zoom100:void () {
+        def target:SceneNode (this.contentBox((this.viewRoot())))
+        zoom = 1.0
+        panX = (40.0 - target.x)
+        panY = (40.0 - target.y)
+        this.applyView()
+    }
+
+    fn setCamera:void (on:boolean) {
+        if (camera == on) {
+            return
+        }
+        camera = on
+        ; The element tree is built differently either way — with the view on
+        ; the world element or without it — so this is a rebuild, once.
+        laidOut = false
+        this.rebuild()
+    }
+
+    fn setOverscan:void (v:double) {
+        overscan = v
+    }
+
+    fn setView:void (x:double y:double sc:double) {
+        panX = x
+        panY = y
+        zoom = sc
+        if (zoom < 0.05) {
+            zoom = 0.05
+        }
+        if (zoom > 16.0) {
+            zoom = 16.0
+        }
+        this.applyView()
+    }
+
+    ; The whole way down: the scene into an element tree, the tree laid out,
+    ; the layout walked into a display list. Everything that changes what is
+    ; on the page comes through here.
+    fn rebuild:void () {
+        if (ok == false) {
+            return
+        }
+        emitter.setDebug(debug)
+        emitter.setAssets(assets)
+        def root:SceneNode (this.viewRoot())
+        ; With a camera the world element carries NO transform: the list is
+        ; in scene coordinates and the view rides on the list instead. A
+        ; transform here would be applied twice.
+        if camera {
+            def sc:double zoom
+            if (sc < 0.000001) {
+                sc = 0.000001
+            }
+            def vw:double (pageW / sc)
+            def vh:double (pageH / sc)
+            def rl:double (((0.0 - panX) / sc) - (vw * overscan))
+            def rt:double (((0.0 - panY) / sc) - (vh * overscan))
+            def rr:double ((rl + vw) + ((vw * overscan) * 2.0))
+            def rb:double ((rt + vh) + ((vh * overscan) * 2.0))
+            evgRoot = (emitter.buildPageScene(root (this.currentPage()) rl rt rr rb))
+        } {
+            evgRoot = (emitter.buildPage(root (this.currentPage()) panX panY zoom))
+        }
+        dumpStale = true
+        layout = (new EVGLayout())
+        layout.setPageSize(pageW pageH)
+        layout.layout(evgRoot)
+        laidOut = true
+        this.repaint()
+    }
+
+    ; The camera and the region, onto a list about to be built. With the
+    ; camera off this does nothing and the list is the one it always was.
+    ;
+    ; THE REGION IS WHY THIS IS BEFORE THE BUILD. Culling asks what is inside
+    ; the outermost clip, and with the view on the world element that clip was
+    ; the page — so the walk already dropped everything off screen. Take the
+    ; transform away and the page is a window onto a board thousands of units
+    ; across, and there is nothing left to cull against; the region says what
+    ; to cull against instead, and its overscan is what a pan spends.
+    fn aimList:void () {
+        if (camera == false) {
+            return
+        }
+        list.setView(panX panY zoom)
+        def sc:double zoom
+        if (sc < 0.000001) {
+            sc = 0.000001
+        }
+        def vw:double (pageW / sc)
+        def vh:double (pageH / sc)
+        def l:double (((0.0 - panX) / sc) - (vw * overscan))
+        def t:double (((0.0 - panY) / sc) - (vh * overscan))
+        def r:double ((l + vw) + ((vw * overscan) * 2.0))
+        def b:double ((t + vh) + ((vh * overscan) * 2.0))
+        list.setRegion(l t r b)
+    }
+
+    ; The walk, and only the walk. A selection ring or a new view changes
+    ; which commands come out of a tree that is already built and already
+    ; laid out, and rebuilding both for it was most of what a pan cost: on a
+    ; board of 3,565 nodes, 1,230 ms a frame against 210 for the walk.
+    fn repaint:void () {
+        if (ok == false) {
+            return
+        }
+        if (laidOut == false) {
+            this.rebuild()
+            return
+        }
+        list = (new EVGDisplayList())
+        list.setTextEngine((layout.getTextEngine()))
+        this.aimList()
+        list.build(evgRoot)
+        cmdCount = (array_length list.cmds)
+        if ((strlen selected) > 0) {
+            this.paintSelect()
+        }
+    }
+
+    ; Pan and zoom move the pixels, not the boxes. The transform is one
+    ; attribute on the world element and the layout underneath it does not
+    ; change, so a view change writes that attribute and walks the tree
+    ; again — no second element tree, no second layout.
+    fn applyView:void () {
+        if (ok == false) {
+            return
+        }
+        if (laidOut == false) {
+            this.rebuild()
+            return
+        }
+        ; With a camera the list does not change when the view does: the
+        ; commands are in scene coordinates and the painter multiplies. This
+        ; is the whole gain — no tree walk, no flatten, no second layout —
+        ; and the host decides when the view has moved far enough that the
+        ; list has to be walked for a new region (`gl/evg-view.js`).
+        if camera {
+            list.setView(panX panY zoom)
+            dumpStale = true
+            return
+        }
+        if ((evgRoot.getChildCount()) == 0) {
+            this.rebuild()
+            return
+        }
+        def world:EVGElement (evgRoot.getChild(0))
+        world.setAttribute("transform" (SceneToEVG.viewTransform(panX panY zoom)))
+        dumpStale = true
+        this.repaint()
+    }
+
+    ; The ring around the selected layer. Its box has to be walked to, not
+    ; read off the node: `x`/`y` are an offset from the PARENT, so a title
+    ; twenty pixels into a card three thousand pixels across the board drew
+    ; its ring at 20,16 — in the page's top-left corner, nowhere near the
+    ; layer it was pointing at.
+    ; Whether the ENGINE draws the selection ring. A host that draws its own
+    ; — one with a DOM overlay over the board — turns this off, because the
+    ; ring it draws is better than the one here can be: in camera mode this
+    ; one's thickness is 2/zoom SCENE units, chosen when the frame is built,
+    ; and a kept frame moved to another zoom carries the band it was built
+    ; with. Fit a board and then zoom to 160% and the ring is thirty pixels
+    ; wide. An overlay follows the view instead of being baked into it.
+    def ring:boolean true
+
+    fn setRing:void (on:boolean) {
+        ring = on
+        this.rebuild()
+    }
+
+    fn paintSelect:void () {
+        if (ring == false) {
+            return
+        }
+        def n:SceneNode (this.absBox(selected))
+        if ((strlen n.id) == 0) {
+            return
+        }
+        ; THE RING LEANS THE WAY THE LAYER DOES. Drawn on the containing box
+        ; it was an upright rectangle around a turned shape, which says the
+        ; layer is straight and half again as big as it is — and on a board
+        ; where a layer can be turned it is the one thing the ring is for.
+        ; So the ring is the layer's OWN box at its own angle, and the
+        ; containing box is only the fallback for a matrix that is not a
+        ; turn at all.
+        def deg:double 0.0
+        def ox:double 0.0
+        def oy:double 0.0
+        def bx:double n.x
+        def by:double n.y
+        def bw:double n.w
+        def bh:double n.h
+        if n.hasXf {
+            if (n.xf.isSimilarity()) {
+                deg = (n.xf.rotationDeg())
+                bw = (n.ow * (n.xf.uniformScale()))
+                bh = (n.oh * (n.xf.uniformScale()))
+                ox = n.xf.tx
+                oy = n.xf.ty
+                bx = ox
+                by = oy
+                ; A MIRROR IS NOT A TURN, and read as one the ring lands
+                ; BESIDE the layer — a whole width away, touching it, which
+                ; is what an arrow inside a mirrored instance showed. The
+                ; matrix is M = R(theta) diag(1, -1): the flip sends the
+                ; layer's box [0,h] to [-h,0] BEFORE the turn, so the
+                ; rectangle that is turned starts a height higher up. The
+                ; turn is still about the origin the matrix names.
+                if (n.xf.isMirrored()) {
+                    by = (oy - bh)
+                }
+            }
+        }
+        ; In the coordinates the LIST is written in: page pixels with the
+        ; view baked, scene units with a camera. The ring is a command like
+        ; any other, so it has to be in the same space as the rest of them.
+        def x:double ((bx * zoom) + panX)
+        def y:double ((by * zoom) + panY)
+        def w:double (bw * zoom)
+        def h:double (bh * zoom)
+        ox = ((ox * zoom) + panX)
+        oy = ((oy * zoom) + panY)
+        def ringW:double 2.0
+        if camera {
+            x = bx
+            y = by
+            w = bw
+            h = bh
+            ox = bx
+            oy = by
+            ; …and a ring that is 2 px on the page is 2/zoom in the scene,
+            ; because the camera will multiply it. A kept frame drawn at
+            ; another scale carries the ring it was built with, which is why
+            ; the band is worth keeping narrow enough that nobody sees it.
+            if (zoom > 0.000001) {
+                ringW = (2.0 / zoom)
+            }
+        }
+        ; A divider is a line: zero high, and a ring of no height is not a
+        ; selection anyone can see.
+        if (w < 2.0) {
+            w = 2.0
+        }
+        if (h < 2.0) {
+            h = 2.0
+        }
+        ; A muted blue-green, the same colour the DOM overlay draws: the ring
+        ; is over the DOCUMENT, and a chrome blue is one more blue box on a
+        ; board covered in blue stickies.
+        list.addTurnedFrame(x y w h ringW (EVGColor.rgb(45 107 102)) deg ox oy)
+        cmdCount = (array_length list.cmds)
+    }
+
+    ; A node's box in the coordinates the view is drawn in: its own offset
+    ; plus every parent's, the same walk the hit test makes.
+    fn absBox:SceneNode (id:string) {
+        def box (new SceneNode())
+        if ((strlen id) == 0) {
+            return box
+        }
+        def found:boolean (this.absWalk((this.viewRoot()) (SceneMatrix.ident()) id box))
+        return box
+    }
+
+    ; The walk carries the transform, not an offset: a rotated layer is
+    ; drawn through its matrix, so its corners are where the matrix puts
+    ; them and a ring drawn at x/y hung in the air beside it. The ring
+    ; itself stays square — the list draws axis-aligned frames — so what a
+    ; turned layer gets is the box that CONTAINS it, which points at the
+    ; right thing where the old one did not.
+    fn absWalk:boolean (n:SceneNode m:SceneMatrix id:string box:SceneNode) {
+        def here:SceneMatrix (m.mul((SceneMatrix.translate(n.x n.y))))
+        if n.hasXf {
+            here = (here.mul((n.xf.rotOnly())))
+        }
+        if (n.id == id) {
+            def x0:double (here.applyX(0.0 0.0))
+            def y0:double (here.applyY(0.0 0.0))
+            def x1:double (here.applyX(n.w 0.0))
+            def y1:double (here.applyY(n.w 0.0))
+            def x2:double (here.applyX(n.w n.h))
+            def y2:double (here.applyY(n.w n.h))
+            def x3:double (here.applyX(0.0 n.h))
+            def y3:double (here.applyY(0.0 n.h))
+            def minX:double (FigApp.least4(x0 x1 x2 x3))
+            def minY:double (FigApp.least4(y0 y1 y2 y3))
+            def maxX:double (FigApp.most4(x0 x1 x2 x3))
+            def maxY:double (FigApp.most4(y0 y1 y2 y3))
+            box.id = n.id
+            box.x = minX
+            box.y = minY
+            box.w = (maxX - minX)
+            box.h = (maxY - minY)
+            ; …and HOW it is placed, beside where it ends up. The box above
+            ; is the rectangle that CONTAINS a turned layer, which is what a
+            ; hit test and a snap want; a ring wants the layer's own box and
+            ; the angle it leans at, and both are in this matrix.
+            box.xf = here
+            box.hasXf = true
+            box.ow = n.w
+            box.oh = n.h
+            return true
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            def ch:SceneNode (itemAt n.children i)
+            if (this.absWalk(ch here id box)) {
+                return true
+            }
+            i = (i + 1)
+        }
+        return false
+    }
+
+    sfn least4:double (a:double b:double c:double d:double) {
+        def m:double a
+        if (b < m) {
+            m = b
+        }
+        if (c < m) {
+            m = c
+        }
+        if (d < m) {
+            m = d
+        }
+        return m
+    }
+
+    sfn most4:double (a:double b:double c:double d:double) {
+        def m:double a
+        if (b > m) {
+            m = b
+        }
+        if (c > m) {
+            m = c
+        }
+        if (d > m) {
+            m = d
+        }
+        return m
+    }
+
+    fn findScene:SceneNode (id:string) {
+        return (this.findWalk((this.currentPage()) id))
+    }
+
+    fn findWalk:SceneNode (n:SceneNode id:string) {
+        if (n.id == id) {
+            return n
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            def ch:SceneNode (itemAt n.children i)
+            def hit:SceneNode (this.findWalk(ch id))
+            if ((strlen hit.id) > 0) {
+                return hit
+            }
+            i = (i + 1)
+        }
+        return (new SceneNode())
+    }
+
+    fn sceneJson:string () {
+        def body:string (list.toJson())
+        return ("{\"width\":" + (to_string (to_int pageW)) + ",\"height\":" + (to_string (to_int pageH)) + ",\"list\":" + body + "}")
+    }
+
+    ; The same frame as typed arrays. A board is thousands of commands and
+    ; tens of thousands of coordinates, and writing that as text — a number
+    ; at a time — was most of what a pan cost: of 9.1 seconds of profile,
+    ; `toJson` and the number formatting under it were 42%, and the garbage
+    ; they made another 33%. The host reads these arrays as they are.
+    ; `EVGSceneBinary` carries exactly what the JSON carried, to the
+    ; hundredth, which is what lets the two be compared field by field.
+    fn sceneBinary:EVGSceneBinary () {
+        def bin:EVGSceneBinary (list.toBinary())
+        bin.width = pageW
+        bin.height = pageH
+        return bin
+    }
+
+    fn sceneGraphJson:string () {
+        return (sceneDoc.toJson())
+    }
+
+    fn evgText:string () {
+        if dumpStale {
+            evgDump = (emitter.dump(evgRoot))
+            dumpStale = false
+        }
+        return evgDump
+    }
+
+    ; What is under the pointer. Three things decide it, and each of them
+    ; was picking the wrong layer.
+    ;
+    ; THE POINT TRAVELS INTO EACH LAYER'S OWN SPACE. A rotated layer is
+    ; drawn through its transform and the hit test was made against the
+    ; unrotated box, so a tilted card answered for the space beside it and
+    ; never for itself — and the more a thing was turned, the further away
+    ; you had to click. The point is moved into the child's space on the
+    ; way down, the same way the renderer moves the pixels.
+    ;
+    ; A CHILD IS LOOKED AT WHETHER OR NOT ITS PARENT CONTAINS THE POINT.
+    ; Only a layer that CLIPS can keep its children from being picked.
+    ; Gating the walk on the parent's box made anything hanging out of its
+    ; frame unselectable — a sticker over a section's corner, an icon past
+    ; the edge of its button — and a group whose own box is empty, which a
+    ; FigJam frame often is, hid everything inside it.
+    ;
+    ; WHAT DRAWS WINS OVER WHAT DOES NOT, AND THE DEEPER OF TWO WINS. The
+    ; walk used to answer with the last layer it happened to be inside, so
+    ; a click landed on whatever container was drawn last rather than on
+    ; the thing you were pointing at. A layer that puts ink on the canvas
+    ; outranks the boxes it sits in, the deepest of those outranks its
+    ; parents, and between two of the same rank the one painted later wins
+    ; — which is the one on top.
+    fn hit:string (x:double y:double) {
+        def sx:double ((x - panX) / zoom)
+        def sy:double ((y - panY) / zoom)
+        hitId = ""
+        hitScore = (0 - 1)
+        this.hitWalk((this.viewRoot()) sx sy 0)
+        return hitId
+    }
+
+    fn hitWalk:void (n:SceneNode x:double y:double depth:int) {
+        def inside:boolean false
+        if ((((x >= 0.0) && (x <= n.w)) && (y >= 0.0)) && (y <= n.h)) {
+            inside = true
+        }
+        if (n.sourceType == "CANVAS") {
+            inside = true
+        }
+        if inside {
+            ; The stroke outline is not a layer anyone drew: it is the one
+            ; this reader emits to paint a layer's own stroke, and it sits
+            ; UNDER that layer, so it is deeper than the thing beside it
+            ; and was answering for it — a click on a table's heading came
+            ; back with the cell's rule.
+            if ((n.sourceType != "CANVAS") && ((strlen n.id) > 0) && (n.sourceType != "STROKE_GEOMETRY")) {
+                def score:int depth
+                if ((FigToScene.drawsNothing(n)) == false) {
+                    score = (score + 100000)
+                }
+                if (score >= hitScore) {
+                    hitScore = score
+                    hitId = n.id
+                }
+            }
+        }
+        ; A clip is the one thing that stops the walk: outside it, nothing
+        ; inside it is drawn, so nothing inside it can be picked either.
+        if n.clip {
+            if (inside == false) {
+                return
+            }
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            def ch:SceneNode (itemAt n.children i)
+            def lx:double (x - ch.x)
+            def ly:double (y - ch.y)
+            if ch.hasXf {
+                def rx:double (ch.xf.unrotX(lx ly))
+                def ry:double (ch.xf.unrotY(lx ly))
+                lx = rx
+                ly = ry
+            }
+            this.hitWalk(ch lx ly (depth + 1))
+            i = (i + 1)
+        }
+    }
+
+    fn statsJson:string () {
+        def o:string "{"
+        o = (o + "\"ok\":")
+        if ok {
+            o = (o + "true")
+        } {
+            o = (o + "false")
+        }
+        o = (o + ",\"error\":\"" + (this.esc(err)) + "\"")
+        o = (o + ",\"file\":\"" + (this.esc(doc.fileName)) + "\"")
+        o = (o + ",\"prelude\":\"" + (this.esc(doc.prelude)) + "\"")
+        o = (o + ",\"version\":" + (to_string doc.version))
+        o = (o + ",\"nodes\":" + (to_string (array_length doc.nodes)))
+        o = (o + ",\"pages\":" + (to_string (array_length doc.pages)))
+        o = (o + ",\"blobs\":" + (to_string (array_length doc.blobs)))
+        ; What the tree could not place. On a paste these are the copied
+        ; layers and "adopted" should match; anywhere else a non-zero
+        ; count is content the viewer parsed and did not draw.
+        o = (o + ",\"orphans\":" + (to_string doc.orphanCount))
+        o = (o + ",\"unrooted\":" + (to_string doc.unrootedCount))
+        o = (o + ",\"adopted\":" + (to_string doc.adoptedCount))
+        o = (o + ",\"images\":" + (to_string (array_length doc.images)))
+        o = (o + ",\"schemaTypes\":" + (to_string doc.schemaCount))
+        o = (o + ",\"cmds\":" + (to_string cmdCount))
+        o = (o + ",\"debug\":")
+        if debug {
+            o = (o + "true")
+        } {
+            o = (o + "false")
+        }
+        o = (o + ",\"pasted\":")
+        if doc.pasted {
+            o = (o + "true")
+        } {
+            o = (o + "false")
+        }
+        o = (o + ",\"zstd\":")
+        if doc.usedZstd {
+            o = (o + "true")
+        } {
+            o = (o + "false")
+        }
+        o = (o + ",\"ms\":{")
+        o = (o + "\"zip\":" + (to_string doc.zipMs))
+        o = (o + ",\"inflate\":" + (to_string doc.inflateMs))
+        o = (o + ",\"zstd\":" + (to_string doc.zstdMs))
+        o = (o + ",\"schema\":" + (to_string doc.schemaMs))
+        o = (o + ",\"decode\":" + (to_string doc.decodeMs))
+        o = (o + ",\"tree\":" + (to_string doc.treeMs))
+        o = (o + ",\"total\":" + (to_string doc.totalMs))
+        o = (o + "}}")
+        return o
+    }
+
+    fn pagesJson:string () {
+        def o:string "["
+        def i:int 0
+        while (i < (array_length sceneDoc.pages)) {
+            if (i > 0) {
+                o = (o + ",")
+            }
+            def p:SceneNode (itemAt sceneDoc.pages i)
+            o = (o + "{\"id\":\"" + (this.esc(p.id)) + "\",\"name\":\"" + (this.esc(p.name)) + "\",\"type\":\"" + (this.esc(p.sourceType)) + "\"}")
+            i = (i + 1)
+        }
+        return (o + "]")
+    }
+
+    fn framesJson:string () {
+        def frames:[SceneNode] (this.framesOnPage())
+        def o:string "["
+        def i:int 0
+        while (i < (array_length frames)) {
+            if (i > 0) {
+                o = (o + ",")
+            }
+            def f:SceneNode (itemAt frames i)
+            o = (o + "{\"id\":\"" + (this.esc(f.id)) + "\",\"name\":\"" + (this.esc(f.name)) + "\",\"w\":" + (to_string f.w) + ",\"h\":" + (to_string f.h) + "}")
+            i = (i + 1)
+        }
+        return (o + "]")
+    }
+
+    fn treeJson:string () {
+        def root:SceneNode (this.currentPage())
+        return (this.nodeTree(root 0))
+    }
+
+    fn nodeTree:string (nd:SceneNode depth:int) {
+        if (depth > 24) {
+            return "{}"
+        }
+        def o:string "{\"id\":\""
+        o = (o + (this.esc(nd.id)) + "\",\"name\":\"" + (this.esc(nd.name)))
+        o = (o + "\",\"type\":\"" + (this.esc(nd.sourceType)) + "\"")
+        o = (o + ",\"kind\":\"" + (this.esc(nd.kind)) + "\"")
+        o = (o + ",\"w\":" + (to_string nd.w) + ",\"h\":" + (to_string nd.h))
+        o = (o + ",\"children\":[")
+        def i:int 0
+        while (i < (array_length nd.children)) {
+            if (i > 0) {
+                o = (o + ",")
+            }
+            o = (o + (this.nodeTree((itemAt nd.children i) (depth + 1))))
+            i = (i + 1)
+        }
+        return (o + "]}")
+    }
+
+    fn propsJson:string () {
+        if ((strlen selected) == 0) {
+            return "{}"
+        }
+        def nd:FigNode (doc.nodeById(selected))
+        def sn:SceneNode (this.findScene(selected))
+        def o:string "{"
+        o = (o + "\"id\":\"" + (this.esc(selected)) + "\"")
+        o = (o + ",\"figma\":{")
+        o = (o + "\"name\":\"" + (this.esc(nd.name)) + "\"")
+        o = (o + ",\"type\":\"" + (this.esc(nd.typeName)) + "\"")
+        o = (o + ",\"x\":" + (to_string nd.m02) + ",\"y\":" + (to_string nd.m12))
+        o = (o + ",\"w\":" + (to_string nd.w) + ",\"h\":" + (to_string nd.h))
+        o = (o + "}")
+        ; THE SELECTED LAYER, not the page around it. This used to carry
+        ; `evgText()` — the WHOLE page's element tree, escaped a character at
+        ; a time — beside a scene walk 24 levels deep. Nothing read the
+        ; element tree and nobody can read twelve megabytes of JSON, and
+        ; building it was 2.8 seconds of a 5-second profile of clicking a
+        ; layer. Four levels is what a reader is actually checking: this
+        ; layer, and what it is made of.
+        o = (o + ",\"scene\":" + (sn.toJsonDepth(20)))
+        return (o + "}")
+    }
+
+    ; --- selection debug -------------------------------------------------
+    ;
+    ; Everything about ONE layer that decides how it came out, as plain
+    ; text you can read or paste somewhere. The reports beside this one
+    ; answer for the whole file — how many of each type drew nothing, which
+    ; fields nobody reads — and a file is where you start when you do not
+    ; know what is wrong. This is for when you are pointing at the thing:
+    ; it says what the file gave this layer, what the reader made of it,
+    ; and which of the two is missing the colour.
+    ;
+    ; It reads the layer AND the node it came from, because most of what
+    ; goes wrong is the difference between them: a fill that names a style
+    ; the file does not carry, an instance whose component is not here, an
+    ; image whose bytes are not, text whose glyphs the file never shaped.
+    fn layerDebug:string (id:string) {
+        if ((strlen id) == 0) {
+            return "nothing selected"
+        }
+        def n:SceneNode (this.findScene(id))
+        if ((strlen n.id) == 0) {
+            return ("no layer " + id)
+        }
+        def o:string ("layer  " + id)
+        def base:string (FigApp.baseId(id))
+        if (base != id) {
+            o = (o + "\n       a layer of " + base + " that Figma built, not a node of its own")
+        }
+        def nd:FigNode (doc.nodeById(base))
+        o = (o + "\npath   " + (this.layerPath(id)))
+        o = (o + "\nscene  " + n.kind + "  from " + n.sourceType)
+        if ((strlen n.name) > 0) {
+            o = (o + "  \"" + n.name + "\"")
+        }
+        def box:SceneNode (this.absBox(id))
+        o = (o + "\nbox    " + (to_string n.w) + " x " + (to_string n.h))
+        o = (o + "  at " + (to_string n.x) + "," + (to_string n.y) + " in its parent")
+        o = (o + "  (" + (to_string box.x) + "," + (to_string box.y) + " on the page)")
+        if n.hasXf {
+            o = (o + "\nturned " + (to_string (n.xf.rotationDeg())) + " degrees")
+            if (n.xf.isMirrored()) {
+                o = (o + ", and MIRRORED — the matrix reverses handedness")
+            }
+            def mscale:double (n.xf.uniformScale())
+            if ((fabs (mscale - 1.0)) > 0.001) {
+                o = (o + "\n       scaled by " + (to_string mscale) + " as well")
+            }
+            o = (o + "\nmatrix " + (to_string n.xf.a) + " " + (to_string n.xf.c) + " " + (to_string n.xf.tx))
+            o = (o + "\n       " + (to_string n.xf.b) + " " + (to_string n.xf.d) + " " + (to_string n.xf.ty))
+            if ((n.xf.isSimilarity()) == false) {
+                o = (o + "\n       NOT A SIMILARITY — its two columns are not the same length or")
+                o = (o + "\n       not at right angles, so it is a skew or a scale that differs by")
+                o = (o + "\n       axis. A turn and one factor cannot say that, and the layer is")
+                o = (o + "\n       drawn as the nearest turn: the picture is wrong, not just soft.")
+            }
+        }
+        if (n.visible == false) {
+            o = (o + "\nHIDDEN the file says this layer is not visible")
+        }
+        if (n.opacity < 0.999) {
+            o = (o + "\nopacity " + (to_string n.opacity))
+        }
+        if n.clip {
+            o = (o + "\nclips  what is inside it is cut to this box")
+        }
+
+        ; What it puts on the canvas, and what it was given to put there.
+        o = (o + "\n\nWHAT IT DRAWS")
+        if (FigToScene.drawsNothing(n)) {
+            o = (o + "\n  NOTHING — no fill, no stroke, no path, no image, no text")
+        }
+        o = (o + "\n  fills " + (to_string (array_length n.fills)))
+        def fi:int 0
+        while (fi < (array_length n.fills)) {
+            def f:SceneFill (itemAt n.fills fi)
+            o = (o + "\n    " + f.kind + " " + (f.hexA()))
+            if (f.kind == "gradient") {
+                o = (o + " to " + (f.gradHexA()))
+            }
+            if (f.visible == false) {
+                o = (o + "  OFF — the file switches this paint off")
+            }
+            if ((strlen f.imageRef) > 0) {
+                o = (o + "  image " + f.imageRef)
+                if (assets.hasImage(f.imageRef)) {
+                    o = (o + " (bytes are in the file)")
+                } {
+                    o = (o + "  MISSING — the bytes are not in the file, so it paints grey")
+                }
+                o = (o + "\n      fit " + f.imageFit)
+                if ((f.imageRotation > 0.01) || (f.imageRotation < (0.0 - 0.01))) {
+                    o = (o + ", turned " + (to_string f.imageRotation) + " degrees INSIDE the box — not drawn")
+                }
+                if f.imageCropped {
+                    o = (o + ", showing the part of it from " + (to_string f.cropX) + "," + (to_string f.cropY))
+                    o = (o + " and " + (to_string f.cropW) + " by " + (to_string f.cropH) + " of the bitmap")
+                }
+            }
+            fi = (fi + 1)
+        }
+        o = (o + "\n  strokes " + (to_string (array_length n.strokes)))
+        if ((array_length n.strokes) > 0) {
+            def st:SceneStroke (n.firstStroke())
+            o = (o + "\n    " + (st.hex()) + "  weight " + (to_string st.weight) + "  " + st.align)
+            if (st.visible == false) {
+                o = (o + "  OFF")
+            }
+            if n.strokeIsGeometry {
+                o = (o + "\n    painted by the outline the file brought, as a child of this layer")
+            }
+        }
+        if ((strlen n.pathData) > 0) {
+            o = (o + "\n  path  " + (to_string (strlen n.pathData)) + " characters of outline")
+        }
+        if (n.kind == "text") {
+            o = (o + "\n  text  \"" + n.text.characters + "\"")
+            o = (o + "\n        " + n.text.fontFamily + " " + n.text.fontWeight + " " + (to_string n.text.fontSize) + "px")
+            if (n.text.hasOutline()) {
+                o = (o + "\n        drawn as the glyphs the editor shaped — the font on this machine does not matter")
+            } {
+                o = (o + "\n        NO GLYPHS in the file, so it is laid out here in whatever font this machine has:")
+                o = (o + "\n        a missing family is where a box or a tofu square comes from")
+            }
+        }
+        o = (o + "\n  children " + (to_string (array_length n.children)))
+        def ci:int 0
+        while (ci < (array_length n.children)) {
+            def ch:SceneNode (itemAt n.children ci)
+            if (ci < 8) {
+                o = (o + "\n    " + ch.kind + " " + ch.sourceType + " " + ch.id)
+            }
+            ci = (ci + 1)
+        }
+        if ((array_length n.children) > 8) {
+            o = (o + "\n    … and " + (to_string ((array_length n.children) - 8)) + " more")
+        }
+        if ((array_length n.warnings) > 0) {
+            o = (o + "\n  the reader could not draw:")
+            def wi:int 0
+            while (wi < (array_length n.warnings)) {
+                def w:SceneWarn (itemAt n.warnings wi)
+                o = (o + "\n    " + w.feature)
+                wi = (wi + 1)
+            }
+        }
+
+        ; And the node the file actually carries.
+        if ((strlen nd.id) == 0) {
+            o = (o + "\n\nWHAT THE FILE SAYS\n  no node " + base + " in the file")
+            return o
+        }
+        o = (o + "\n\nWHAT THE FILE SAYS")
+        o = (o + "\n  " + nd.typeName + "  \"" + nd.name + "\"")
+        o = (o + (this.paintDebug(nd.raw "fillPaints" "styleIdForFill" "fill")))
+        o = (o + (this.paintDebug(nd.raw "strokePaints" "styleIdForStrokeFill" "stroke")))
+        if ((strlen nd.symbolId) > 0) {
+            o = (o + "\n  instance of " + nd.symbolId)
+            def comp:FigNode (doc.nodeById(nd.symbolId))
+            if ((strlen comp.id) > 0) {
+                o = (o + " — the component is in the file")
+            } {
+                o = (o + "  NOT IN FILE — a library component that was never copied in, so there is nothing to draw")
+            }
+        } {
+            if (nd.hadSymbolData) {
+                o = (o + "\n  an instance whose symbolData names no component")
+            }
+        }
+        o = (o + (this.unreadDebug(nd)))
+        return o
+    }
+
+    ; A node's paints, and the style it may be leaving them to. A layer
+    ; coloured by a named style usually still carries the colour itself;
+    ; when it does not, and the style is not in the file either, the colour
+    ; is nowhere to be read and the layer draws bare.
+    fn paintDebug:string (raw:KiwiValue field:string styleField:string label:string) {
+        def o:string ""
+        def paints:KiwiValue (raw.child(field))
+        def n:int (paints.itemCount())
+        o = (o + "\n  " + label + "Paints " + (to_string n))
+        def i:int 0
+        while (i < n) {
+            def p:KiwiValue (paints.item(i))
+            def kind:string (p.childString("type" "SOLID"))
+            o = (o + "\n    " + kind)
+            def col:KiwiValue (p.child("color"))
+            if (col.isObject()) {
+                o = (o + "  rgba " + (to_string (col.childDouble("r" 0.0))) + " " + (to_string (col.childDouble("g" 0.0))) + " " + (to_string (col.childDouble("b" 0.0))) + " " + (to_string (col.childDouble("a" 1.0))))
+            }
+            o = (o + "  opacity " + (to_string (p.childDouble("opacity" 1.0))))
+            if ((p.childBool("visible" true)) == false) {
+                o = (o + "  OFF")
+            }
+            i = (i + 1)
+        }
+        def sid:KiwiValue ((raw.child(styleField)).child("guid"))
+        if (sid.isObject()) {
+            def sess:int (sid.childInt("sessionID" (0 - 1)))
+            def loc:int (sid.childInt("localID" (0 - 1)))
+            if ((sess >= 0) && (loc >= 0)) {
+                def styleId:string ((to_string sess) + ":" + (to_string loc))
+                o = (o + "\n    " + label + " comes from the named style " + styleId)
+                def sn:FigNode (doc.nodeById(styleId))
+                if ((strlen sn.id) > 0) {
+                    o = (o + " — that style IS in the file (the reader does not read it; the paints above are what it draws)")
+                } {
+                    o = (o + " — NOT IN FILE")
+                    if (n == 0) {
+                        o = (o + ", and the layer carries no paint of its own: THIS is a colour nothing can recover")
+                    } {
+                        o = (o + ", but the layer carries the colour itself, so nothing is lost")
+                    }
+                }
+            }
+        }
+        return o
+    }
+
+    ; The fields this node carries that the converter never looks at, with
+    ; the plain-language note where there is one. The same list the whole
+    ; file gets, cut to one layer.
+    fn unreadDebug:string (nd:FigNode) {
+        def known:[string] (FigFieldReport.known())
+        def named:string ""
+        def plain:string ""
+        def i:int 0
+        while (i < (array_length nd.raw.fieldNames)) {
+            def name:string (itemAt nd.raw.fieldNames i)
+            if (FigFieldReport.isKnown(name known)) {
+            } {
+                def note:string (FigFieldReport.noteFor(name))
+                if ((strlen note) > 0) {
+                    named = (named + "\n    " + name + " — " + note)
+                } {
+                    if ((strlen plain) > 0) {
+                        plain = (plain + ", ")
+                    }
+                    plain = (plain + name)
+                }
+            }
+            i = (i + 1)
+        }
+        def o:string ""
+        if ((strlen named) > 0) {
+            o = (o + "\n  fields here that change what you see and are not read:" + named)
+        }
+        if ((strlen plain) > 0) {
+            o = (o + "\n  other fields not read: " + plain)
+        }
+        return o
+    }
+
+    ; Where the layer sits, named from the page down. "I do not know which
+    ; element it is" is most of what makes a wrong-looking page hard to
+    ; report, and a path answers it.
+    fn layerPath:string (id:string) {
+        def trail:[string]
+        def i:int 0
+        while (i < (array_length sceneDoc.pages)) {
+            if (this.pathWalk((itemAt sceneDoc.pages i) id trail)) {
+                def o:string ""
+                def j:int ((array_length trail) - 1)
+                while (j >= 0) {
+                    if ((strlen o) > 0) {
+                        o = (o + " > ")
+                    }
+                    o = (o + (itemAt trail j))
+                    j = (j - 1)
+                }
+                return o
+            }
+            i = (i + 1)
+        }
+        return "?"
+    }
+
+    fn pathWalk:boolean (n:SceneNode id:string trail:[string]) {
+        def label:string n.sourceType
+        if ((strlen n.name) > 0) {
+            label = (label + " \"" + n.name + "\"")
+        }
+        if (n.id == id) {
+            push trail label
+            return true
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            if (this.pathWalk((itemAt n.children i) id trail)) {
+                push trail label
+                return true
+            }
+            i = (i + 1)
+        }
+        return false
+    }
+
+    ; "13709:3736#40000000:0" → "13709:3736": the node a built layer is of.
+    sfn baseId:string (id:string) {
+        def n:int (strlen id)
+        def i:int 0
+        while (i < n) {
+            if ((charAt id i) == 35) {
+                return (substring id 0 i)
+            }
+            i = (i + 1)
+        }
+        return id
+    }
+
+    ; --- the inspector ---------------------------------------------------
+    ;
+    ; What the right-hand pane shows about the selected layer, and the
+    ; values its fields write back. Small on purpose: `propsJson` carries
+    ; the whole EVG dump, which is megabytes on a real board and not
+    ; something to re-read on every keystroke.
+    fn inspectJson:string () {
+        if ((strlen selected) == 0) {
+            return "{}"
+        }
+        def n:SceneNode (this.findScene(selected))
+        if ((strlen n.id) == 0) {
+            return "{}"
+        }
+        def box:SceneNode (this.absBox(selected))
+        def nd:FigNode (doc.nodeById(selected))
+        def o:string "{"
+        o = (o + "\"id\":\"" + (this.esc(n.id)) + "\"")
+        o = (o + ",\"name\":\"" + (this.esc(n.name)) + "\"")
+        o = (o + ",\"kind\":\"" + (this.esc(n.kind)) + "\"")
+        o = (o + ",\"source\":\"" + (this.esc(n.sourceType)) + "\"")
+        o = (o + ",\"x\":" + (to_string n.x) + ",\"y\":" + (to_string n.y))
+        o = (o + ",\"w\":" + (to_string n.w) + ",\"h\":" + (to_string n.h))
+        o = (o + ",\"pageX\":" + (to_string box.x) + ",\"pageY\":" + (to_string box.y))
+        o = (o + ",\"opacity\":" + (to_string n.opacity))
+        o = (o + ",\"visible\":" + (FigApp.jsonBool(n.visible)))
+        o = (o + ",\"clip\":" + (FigApp.jsonBool(n.clip)))
+        o = (o + ",\"radius\":" + (to_string n.radius.tl))
+        o = (o + ",\"radiusUniform\":" + (FigApp.jsonBool(n.radius.uniform)))
+        o = (o + ",\"children\":" + (to_string (array_length n.children)))
+        o = (o + ",\"hasPath\":" + (FigApp.jsonBool(((strlen n.pathData) > 0))))
+        o = (o + ",\"image\":\"" + (this.esc(n.imageRef)) + "\"")
+        if ((array_length n.fills) > 0) {
+            def f:SceneFill (n.firstFill())
+            o = (o + ",\"fill\":{\"kind\":\"" + f.kind + "\",\"hex\":\"" + (f.hex()) + "\"")
+            o = (o + ",\"alpha\":" + (to_string (f.a * f.opacity)))
+            o = (o + ",\"visible\":" + (FigApp.jsonBool(f.visible)) + "}")
+            ; EVERY paint, not just the first. A layer carries a LIST of them
+            ; and the pane showed one swatch, so a card painted with a tint
+            ; over a photo was a photo as far as the panel was concerned.
+            ;
+            ; And the paint's OWN opacity beside its colour, which is how the
+            ; file writes it and how Figma shows it: a frame filled
+            ; #ff8f82 at 15% has a colour of full strength and a paint at
+            ; 0.15, and folding the two into one #rrggbbaa left the 15%
+            ; nowhere the panel could reach.
+            o = (o + ",\"fills\":[")
+            def fi:int 0
+            while (fi < (array_length n.fills)) {
+                def fx2:SceneFill (itemAt n.fills fi)
+                if (fi > 0) {
+                    o = (o + ",")
+                }
+                o = (o + "{\"kind\":\"" + fx2.kind + "\",\"hex\":\"" + (fx2.hex()) + "\"")
+                o = (o + ",\"opacity\":" + (to_string (fx2.a * fx2.opacity)))
+                o = (o + ",\"visible\":" + (FigApp.jsonBool(fx2.visible)))
+                o = (o + ",\"image\":\"" + (this.esc(fx2.imageRef)) + "\"}")
+                fi = (fi + 1)
+            }
+            o = (o + "]")
+        }
+        if ((array_length n.strokes) > 0) {
+            def st:SceneStroke (n.firstStroke())
+            o = (o + ",\"stroke\":{\"hex\":\"" + (st.hex()) + "\",\"weight\":" + (to_string st.weight))
+            o = (o + ",\"align\":\"" + st.align + "\"}")
+        }
+        if (n.kind == "text") {
+            o = (o + ",\"text\":{\"chars\":\"" + (this.esc(n.text.characters)) + "\"")
+            o = (o + ",\"family\":\"" + (this.esc(n.text.fontFamily)) + "\"")
+            o = (o + ",\"size\":" + (to_string n.text.fontSize))
+            o = (o + ",\"weight\":\"" + n.text.fontWeight + "\"")
+            o = (o + ",\"style\":\"" + n.text.fontStyle + "\"")
+            o = (o + ",\"lineHeight\":" + (to_string n.text.lineHeight))
+            o = (o + ",\"letterSpacing\":" + (to_string n.text.letterSpacing))
+            o = (o + ",\"align\":\"" + n.text.align + "\"")
+            o = (o + ",\"outline\":" + (FigApp.jsonBool((n.text.hasOutline()))) + "}")
+        }
+        if (n.layout.isFlex()) {
+            o = (o + ",\"layout\":{\"mode\":\"" + n.layout.mode + "\",\"gap\":" + (to_string n.layout.gap))
+            o = (o + ",\"padding\":[" + (to_string n.layout.padT) + "," + (to_string n.layout.padR))
+            o = (o + "," + (to_string n.layout.padB) + "," + (to_string n.layout.padL) + "]")
+            o = (o + ",\"justify\":\"" + n.layout.justify + "\",\"align\":\"" + n.layout.alignItems + "\"}")
+        }
+        o = (o + ",\"effects\":[")
+        def e:int 0
+        while (e < (array_length n.effects)) {
+            def fx:SceneEffect (itemAt n.effects e)
+            if (e > 0) {
+                o = (o + ",")
+            }
+            o = (o + "{\"kind\":\"" + fx.kind + "\",\"blur\":" + (to_string fx.blur))
+            o = (o + ",\"x\":" + (to_string fx.x) + ",\"y\":" + (to_string fx.y))
+            o = (o + ",\"hex\":\"" + (SceneFill.rgbHex(fx.r fx.g fx.b)) + "\"}")
+            e = (e + 1)
+        }
+        o = (o + "]")
+        o = (o + ",\"warnings\":[")
+        def w:int 0
+        while (w < (array_length n.warnings)) {
+            def wn:SceneWarn (itemAt n.warnings w)
+            if (w > 0) {
+                o = (o + ",")
+            }
+            o = (o + "\"" + (this.esc(wn.feature)) + "\"")
+            w = (w + 1)
+        }
+        o = (o + "]")
+        ; THE TURN. A layer that is not upright is placed by this number and
+        ; by nothing else the panel shows, so leaving it out left the one
+        ; field that explains a layer being somewhere unexpected off the one
+        ; place you would look for it.
+        if n.hasXf {
+            o = (o + ",\"rotation\":" + (to_string (n.xf.rotationDeg())))
+            o = (o + ",\"mirrored\":" + (FigApp.jsonBool((n.xf.isMirrored()))))
+        } {
+            o = (o + ",\"rotation\":0,\"mirrored\":false")
+        }
+        ; The box this layer is placed INSIDE. Aligning to a parent is
+        ; arithmetic on two rectangles, and the panel has only ever had one
+        ; of them.
+        def par:SceneNode (this.parentScene(selected))
+        if ((strlen par.id) > 0) {
+            o = (o + ",\"parentId\":\"" + (this.esc(par.id)) + "\"")
+            o = (o + ",\"parentName\":\"" + (this.esc(par.name)) + "\"")
+            o = (o + ",\"parentW\":" + (to_string par.w) + ",\"parentH\":" + (to_string par.h))
+        }
+        ; Which component an instance is OF. The reader already follows this
+        ; to draw the instance; saying so is what turns "INSTANCE" from a
+        ; label into somewhere to go.
+        if ((strlen nd.symbolId) > 0) {
+            o = (o + ",\"componentId\":\"" + (this.esc(nd.symbolId)) + "\"")
+            def mas:FigNode (doc.nodeById(nd.symbolId))
+            o = (o + ",\"componentName\":\"" + (this.esc(mas.name)) + "\"")
+        }
+        if ((strlen n.imageRef) > 0) {
+            o = (o + ",\"imageFit\":\"" + (this.esc(n.imageFit)) + "\"")
+        }
+        if ((array_length n.fills) > 0) {
+            def cf:SceneFill (n.firstFill())
+            if ((cf.kind == "image") && cf.imageCropped) {
+                o = (o + ",\"crop\":[" + (to_string cf.cropX) + "," + (to_string cf.cropY))
+                o = (o + "," + (to_string cf.cropW) + "," + (to_string cf.cropH) + "]")
+            }
+        }
+        if ((strlen n.pathData) > 0) {
+            o = (o + ",\"evenOdd\":" + (FigApp.jsonBool(n.evenOdd)))
+        }
+        ; What the file says about this node, for the fields the scene
+        ; graph has no place for.
+        o = (o + ",\"figma\":{\"type\":\"" + (this.esc(nd.typeName)) + "\"")
+        o = (o + ",\"name\":\"" + (this.esc(nd.name)) + "\"}")
+        o = (o + ",\"edits\":" + (to_string edits))
+        return (o + "}")
+    }
+
+    sfn jsonBool:string (v:boolean) {
+        if v {
+            return "true"
+        }
+        return "false"
+    }
+
+    ; --- editing -----------------------------------------------------------
+    ;
+    ; The scene graph is a graph, not a picture: changing a value on it and
+    ; painting again is the whole of an edit. Nothing is written back to
+    ; the file — `revertEdits` re-reads the document it was converted from.
+    def edits:int 0
+
+    fn editNode:SceneNode () {
+        return (this.findScene(selected))
+    }
+
+    fn editRect:void (x:double y:double w:double h:double) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        n.x = x
+        n.y = y
+        ; WHAT IS INSIDE GOES WITH IT. A layer's box is not a frame drawn
+        ; around its content — it IS the content's extent, and a sticky whose
+        ; box was made wider while its body stayed the old width came out as
+        ; a selection ring with a white wedge inside it. Figma resizes the
+        ; subtree; so does this, in proportion.
+        ;
+        ; In proportion and not by constraints: a file carries a constraint
+        ; per layer (pin left, stretch, scale) and none of them is read here,
+        ; so the honest approximation is the one that treats every child the
+        ; same. A layer pinned to the right will move when Figma would have
+        ; held it.
+        def kx:double 1.0
+        def ky:double 1.0
+        if ((w >= 0.0) && (n.w > 0.000001)) {
+            kx = (w / n.w)
+        }
+        if ((h >= 0.0) && (n.h > 0.000001)) {
+            ky = (h / n.h)
+        }
+        if (w >= 0.0) {
+            n.w = w
+        }
+        if (h >= 0.0) {
+            n.h = h
+        }
+        def moved:double ((fabs (kx - 1.0)) + (fabs (ky - 1.0)))
+        if (moved > 0.000001) {
+            def i:int 0
+            while (i < (array_length n.children)) {
+                FigApp.scaleSubtree((itemAt n.children i) kx ky)
+                i = (i + 1)
+            }
+        }
+        this.afterEdit()
+    }
+
+    ; Every layer under this one, by the same two factors. A path is fitted
+    ; into its own box through a viewBox, so its outline follows the box and
+    ; does not have to be rewritten; text keeps its size, because a bigger
+    ; box is somewhere for a line to be longer rather than a reason for it to
+    ; be bigger.
+    sfn scaleSubtree:void (n:SceneNode kx:double ky:double) {
+        n.x = (n.x * kx)
+        n.y = (n.y * ky)
+        n.w = (n.w * kx)
+        n.h = (n.h * ky)
+        def i:int 0
+        while (i < (array_length n.children)) {
+            FigApp.scaleSubtree((itemAt n.children i) kx ky)
+            i = (i + 1)
+        }
+    }
+
+    fn editOpacity:void (v:double) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        if (v < 0.0) {
+            v = 0.0
+        }
+        if (v > 1.0) {
+            v = 1.0
+        }
+        n.opacity = v
+        this.afterEdit()
+    }
+
+    fn editVisible:void (on:boolean) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        n.visible = on
+        this.afterEdit()
+    }
+
+    fn editRadius:void (v:double) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        if (v < 0.0) {
+            v = 0.0
+        }
+        n.radius.setAll(v)
+        this.afterEdit()
+    }
+
+    ; A colour as "#rrggbb". The paint keeps its own alpha: a fill at 15%
+    ; recoloured is still at 15%.
+    fn editFill:void (hex:string) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        def f:SceneFill (new SceneFill())
+        if ((array_length n.fills) > 0) {
+            f = (itemAt n.fills 0)
+        } {
+            push n.fills f
+        }
+        f.kind = "solid"
+        f.visible = true
+        f.r = (FigApp.hexPart(hex 1))
+        f.g = (FigApp.hexPart(hex 3))
+        f.b = (FigApp.hexPart(hex 5))
+        this.afterEdit()
+    }
+
+    ; ONE PAINT OF SEVERAL. `editFill` writes the first, which is the one the
+    ; pane used to show; a layer painted with a tint over a photo has two and
+    ; neither the second colour nor its strength could be reached.
+    fn editFillAt:void (i:int hex:string) {
+        def f:SceneFill (this.fillAt(i))
+        if ((strlen f.kind) == 0) {
+            return
+        }
+        f.kind = "solid"
+        f.r = (FigApp.hexPart(hex 1))
+        f.g = (FigApp.hexPart(hex 3))
+        f.b = (FigApp.hexPart(hex 5))
+        this.afterEdit()
+    }
+
+    ; HOW STRONG THE PAINT IS, which is not how opaque the LAYER is. Figma
+    ; writes the two separately — a frame at 100% filled #ff8f82 at 15% — and
+    ; `editOpacity` moves the layer and everything inside it. This moves the
+    ; paint alone.
+    ;
+    ; Written into the paint's own `opacity` and the colour's alpha reset,
+    ; because the two multiply and a file that put the strength in either one
+    ; has to come back out of the panel as the number that went in.
+    fn editFillOpacity:void (i:int v:double) {
+        def f:SceneFill (this.fillAt(i))
+        if ((strlen f.kind) == 0) {
+            return
+        }
+        def w:double v
+        if (w < 0.0) {
+            w = 0.0
+        }
+        if (w > 1.0) {
+            w = 1.0
+        }
+        f.opacity = w
+        f.a = 1.0
+        this.afterEdit()
+    }
+
+    fn editFillVisible:void (i:int on:boolean) {
+        def f:SceneFill (this.fillAt(i))
+        if ((strlen f.kind) == 0) {
+            return
+        }
+        f.visible = on
+        this.afterEdit()
+    }
+
+    ; The selected layer's nth paint, or a fill with no kind when there is
+    ; none — which every caller above reads as "nothing to write".
+    fn fillAt:SceneFill (i:int) {
+        def none (new SceneFill())
+        none.kind = ""
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return none
+        }
+        if ((i < 0) || (i >= (array_length n.fills))) {
+            return none
+        }
+        return (itemAt n.fills i)
+    }
+
+    ; A stroke a file brought as geometry is painted by a child — the
+    ; outline Figma flattened, filled in the stroke's colour — so an edit
+    ; that only touched the node's own stroke moved the number in the pane
+    ; and left the page exactly as it was.
+    ;
+    ; The colour goes to the outline as well, which is exact. A new WEIGHT
+    ; cannot: the outline IS the old weight, drawn, and there is nothing
+    ; here to re-flatten it with. So the outline is dropped and the stroke
+    ; falls back to the border this reader draws for a file that brought no
+    ; geometry — a guess at the weight you asked for beats an exact picture
+    ; of the one you did not.
+    fn editStroke:void (hex:string weight:double) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        def st:SceneStroke (new SceneStroke())
+        if ((array_length n.strokes) > 0) {
+            st = (itemAt n.strokes 0)
+        } {
+            push n.strokes st
+        }
+        def was:double st.weight
+        st.visible = true
+        st.r = (FigApp.hexPart(hex 1))
+        st.g = (FigApp.hexPart(hex 3))
+        st.b = (FigApp.hexPart(hex 5))
+        def reweighed:boolean false
+        if (weight >= 0.0) {
+            def d:double (weight - was)
+            if ((d > 0.001) || (d < (0.0 - 0.001))) {
+                reweighed = true
+            }
+            st.weight = weight
+        }
+        if n.strokeIsGeometry {
+            this.restrokeOutline(n st reweighed)
+        }
+        this.afterEdit()
+    }
+
+    ; The outline child, recoloured — or dropped, when the weight it was
+    ; flattened at is no longer the weight the layer wants.
+    fn restrokeOutline:void (n:SceneNode st:SceneStroke drop:boolean) {
+        def keep:[SceneNode]
+        def i:int 0
+        while (i < (array_length n.children)) {
+            def ch:SceneNode (itemAt n.children i)
+            if (ch.sourceType == "STROKE_GEOMETRY") {
+                if (drop) {
+                } {
+                    if ((array_length ch.fills) > 0) {
+                        def f:SceneFill (itemAt ch.fills 0)
+                        f.kind = "solid"
+                        f.visible = true
+                        f.r = st.r
+                        f.g = st.g
+                        f.b = st.b
+                    }
+                    push keep ch
+                }
+            } {
+                push keep ch
+            }
+            i = (i + 1)
+        }
+        n.children = keep
+        if drop {
+            n.strokeIsGeometry = false
+        }
+    }
+
+    ; Retyping a layer drops the glyph outlines the editor shaped with it:
+    ; those are the old string, drawn. What replaces them is the text laid
+    ; out here, in whatever font this machine has — which is the honest
+    ; result and says plainly which half of the pipeline drew it.
+    fn editText:void (text:string) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        n.text.characters = text
+        n.text.outline = ""
+        this.afterEdit()
+    }
+
+    ; The layer this one sits in, or an empty node at the top of the page.
+    ; Walked rather than stored: the scene is rebuilt on every edit and a
+    ; parent pointer would be one more thing to keep true.
+    fn parentScene:SceneNode (id:string) {
+        def pages:[SceneNode] sceneDoc.pages
+        def i:int 0
+        while (i < (array_length pages)) {
+            def hit:SceneNode (FigApp.parentWalk((itemAt pages i) id))
+            if ((strlen hit.id) > 0) {
+                return hit
+            }
+            i = (i + 1)
+        }
+        return (new SceneNode())
+    }
+
+    sfn parentWalk:SceneNode (n:SceneNode id:string) {
+        def i:int 0
+        while (i < (array_length n.children)) {
+            def ch:SceneNode (itemAt n.children i)
+            if (ch.id == id) {
+                return n
+            }
+            def deep:SceneNode (FigApp.parentWalk(ch id))
+            if ((strlen deep.id) > 0) {
+                return deep
+            }
+            i = (i + 1)
+        }
+        return (new SceneNode())
+    }
+
+    ; HOW THE LAYER IS PLACED, as the matrix that puts it on the page —
+    ; every ancestor's offset and turn, composed. The host needs its INVERSE
+    ; and not its angle: a pointer travels in page pixels, and what a resize
+    ; means by "wider" is along the LAYER's own axes. One angle is enough
+    ; only while nothing above the layer is turned, and on a board something
+    ; usually is.
+    fn placementJson:string () {
+        if ((strlen selected) == 0) {
+            return "{}"
+        }
+        def box:SceneNode (this.absBox(selected))
+        if (box.hasXf == false) {
+            return "{}"
+        }
+        def o:string ("{\"own\":" + (box.xf.asJson()))
+        o = (o + ",\"w\":" + (to_string box.ow) + ",\"h\":" + (to_string box.oh))
+        ; And the frame the layer's own x/y are written in, which is the one
+        ; a MOVE is in: `editRect` writes into the parent's coordinates.
+        def par:SceneNode (this.parentScene(selected))
+        if ((strlen par.id) > 0) {
+            def pb:SceneNode (this.absBox(par.id))
+            if pb.hasXf {
+                o = (o + ",\"parent\":" + (pb.xf.asJson()))
+            }
+        }
+        return (o + "}")
+    }
+
+    ; THE BOXES A DRAG CAN LINE UP WITH: what the selected layer sits
+    ; beside, and the box it sits in. In PAGE coordinates, because that is
+    ; the frame the host drags in and the only one in which two layers from
+    ; different parents can be said to line up at all.
+    ;
+    ; Siblings and the parent, and nothing further: a board is thousands of
+    ; layers and a guide to one on the other side of it is a guide to
+    ; nothing. What a hand is actually trying to line up with is next to it.
+    fn snapBoxesJson:string () {
+        if ((strlen selected) == 0) {
+            return "[]"
+        }
+        def par:SceneNode (this.parentScene(selected))
+        if ((strlen par.id) == 0) {
+            return "[]"
+        }
+        def out:string "["
+        def first:boolean true
+        def pb:SceneNode (this.absBox(par.id))
+        if (pb.w > 0.0) {
+            out = (out + (FigApp.boxJson(pb)))
+            first = false
+        }
+        def i:int 0
+        while (i < (array_length par.children)) {
+            def ch:SceneNode (itemAt par.children i)
+            if ((ch.id != selected) && ch.visible) {
+                def b:SceneNode (this.absBox(ch.id))
+                if ((b.w > 0.0) && (b.h > 0.0)) {
+                    if (first == false) {
+                        out = (out + ",")
+                    }
+                    out = (out + (FigApp.boxJson(b)))
+                    first = false
+                }
+            }
+            i = (i + 1)
+        }
+        return (out + "]")
+    }
+
+    sfn boxJson:string (b:SceneNode) {
+        return ("{\"x\":" + (to_string b.x) + ",\"y\":" + (to_string b.y)
+            + ",\"w\":" + (to_string b.w) + ",\"h\":" + (to_string b.h) + "}")
+    }
+
+    ; THE TURN, as an angle about the layer's own origin — which is where
+    ; Figma turns one. The mirror is kept: a flipped layer that is given an
+    ; angle stays flipped, because the two are different things and the
+    ; panel has a switch for each.
+    fn editRotation:void (deg:double) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        def rad:double ((deg * 3.141592653589793) / 180.0)
+        def co:double (cos rad)
+        def si:double (sin rad)
+        def sc:double 1.0
+        def mirror:boolean false
+        if n.hasXf {
+            sc = (n.xf.uniformScale())
+            mirror = (n.xf.isMirrored())
+            if (sc < 0.000001) {
+                sc = 1.0
+            }
+        }
+        ; WHERE THE MIDDLE WAS. The file's matrix turns a layer about its own
+        ; ORIGIN — its top-left corner — and that is the number written back.
+        ; But a hand turning a thing turns it about its MIDDLE: about the
+        ; corner, a half turn sends a layer its own height up the page and
+        ; its own width to the left, which is the layer leaving the place it
+        ; was being turned in. So the middle is held and the origin is moved
+        ; to wherever the new angle puts it.
+        def hw:double (n.w * 0.5)
+        def hh:double (n.h * 0.5)
+        ; THE LINEAR PART AND NOT THE MATRIX. `applyX` adds the matrix's own
+        ; translation, and for a layer read from a file that translation is
+        ; the same number `n.x` already holds — the file writes where a layer
+        ; is into m02/m12 and the reader keeps it in both places. Counted
+        ; twice, the middle came out a whole position away and the first turn
+        ; threw the layer across the board.
+        def cx:double (n.x + (FigApp.linX(n.xf hw hh)))
+        def cy:double (n.y + (FigApp.linY(n.xf hw hh)))
+        if (n.hasXf == false) {
+            cx = (n.x + hw)
+            cy = (n.y + hh)
+        }
+        n.xf.a = (co * sc)
+        n.xf.b = (si * sc)
+        if mirror {
+            n.xf.c = (si * sc)
+            n.xf.d = ((0.0 - co) * sc)
+        } {
+            n.xf.c = ((0.0 - si) * sc)
+            n.xf.d = (co * sc)
+        }
+        n.hasXf = true
+        ; The matrix's own translation is not the layer's position — x and y
+        ; are — so the middle is put back by moving those.
+        n.x = (cx - (FigApp.linX(n.xf hw hh)))
+        n.y = (cy - (FigApp.linY(n.xf hw hh)))
+        this.afterEdit()
+    }
+
+    ; A MIRROR is not a turn — no angle reverses handedness — so this is its
+    ; own switch and not a rotation of 180.
+    fn editFlip:void () {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        if (n.hasXf == false) {
+            n.xf = (SceneMatrix.ident())
+            n.hasXf = true
+        }
+        ; About the middle, for the same reason a turn is.
+        def hw:double (n.w * 0.5)
+        def hh:double (n.h * 0.5)
+        def cx:double (n.x + (FigApp.linX(n.xf hw hh)))
+        def cy:double (n.y + (FigApp.linY(n.xf hw hh)))
+        n.xf.c = (0.0 - n.xf.c)
+        n.xf.d = (0.0 - n.xf.d)
+        n.x = (cx - (FigApp.linX(n.xf hw hh)))
+        n.y = (cy - (FigApp.linY(n.xf hw hh)))
+        this.afterEdit()
+    }
+
+    ; A point through a matrix's TURN and SCALE, with its translation left
+    ; out. What a layer's matrix does to an offset, which is all a centre is.
+    sfn linX:double (m:SceneMatrix x:double y:double) {
+        return ((m.a * x) + (m.c * y))
+    }
+
+    sfn linY:double (m:SceneMatrix x:double y:double) {
+        return ((m.b * x) + (m.d * y))
+    }
+
+    fn editClip:void (on:boolean) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        n.clip = on
+        this.afterEdit()
+    }
+
+    ; The text's own numbers. Its CHARACTERS already had a field; the size
+    ; and the alignment that decide where they land did not, so a line that
+    ; came out at the wrong size could be seen and not tried.
+    fn editTextStyle:void (size:double lineHeight:double tracking:double align:string) {
+        def n:SceneNode (this.editNode())
+        if ((strlen n.id) == 0) {
+            return
+        }
+        if (size > 0.0) {
+            n.text.fontSize = size
+        }
+        if (lineHeight > 0.0) {
+            n.text.lineHeight = lineHeight
+        }
+        n.text.letterSpacing = tracking
+        if ((strlen align) > 0) {
+            n.text.align = align
+        }
+        ; The glyphs the editor shaped were shaped at the OLD size. Kept,
+        ; they would draw the old line at the old size and ignore every
+        ; number just typed; dropped, the line is laid out here.
+        n.text.outline = ""
+        this.afterEdit()
+    }
+
+    fn revertEdits:void () {
+        if (ok == false) {
+            return
+        }
+        edits = 0
+        this.convert()
+        this.rebuild()
+    }
+
+    fn editCount:int () {
+        return edits
+    }
+
+    ; An edit changes the scene, so the tree and its layout go with it.
+    fn afterEdit:void () {
+        edits = (edits + 1)
+        laidOut = false
+        this.rebuild()
+    }
+
+    ; One hex pair of "#rrggbb" as 0..1.
+    sfn hexPart:double (hex:string at:int) {
+        if ((strlen hex) < (at + 2)) {
+            return 0.0
+        }
+        def hi:int (FigApp.hexDigit((charAt hex at)))
+        def lo:int (FigApp.hexDigit((charAt hex (at + 1))))
+        def v:int ((hi * 16) + lo)
+        return ((to_double v) / 255.0)
+    }
+
+    sfn hexDigit:int (c:int) {
+        if ((c >= 48) && (c <= 57)) {
+            return (c - 48)
+        }
+        if ((c >= 97) && (c <= 102)) {
+            return ((c - 97) + 10)
+        }
+        if ((c >= 65) && (c <= 70)) {
+            return ((c - 65) + 10)
+        }
+        return 0
+    }
+
+    ; A census of the scene by Figma node type: how many of each, and how
+    ; many of those put nothing on the canvas — no fill, no stroke, no
+    ; path, no image, no text, and no children either. A type whose nodes
+    ; mostly draw nothing is where a page that "does not look like Figma"
+    ; is losing its content, and it points at a type rather than at a
+    ; layer, which is what makes it worth counting.
+    fn censusJson:string () {
+        def types:[string]
+        def totals:[int]
+        def empties:[int]
+        def missingImages:int 0
+        def imageNodes:int 0
+        def i:int 0
+        while (i < (array_length sceneDoc.pages)) {
+            missingImages = (missingImages + (this.censusWalk((itemAt sceneDoc.pages i) types totals empties)))
+            i = (i + 1)
+        }
+        def o:string "{\"types\":["
+        def j:int 0
+        while (j < (array_length types)) {
+            if (j > 0) {
+                o = (o + ",")
+            }
+            o = (o + "{\"type\":\"" + (this.esc((itemAt types j))) + "\"")
+            o = (o + ",\"nodes\":" + (to_string (itemAt totals j)))
+            o = (o + ",\"drawNothing\":" + (to_string (itemAt empties j)) + "}")
+            j = (j + 1)
+        }
+        o = (o + "],\"imagesMissing\":" + (to_string missingImages))
+        ; What the instances brought with them, counted by distinct key.
+        ; `seen` above `used` means entries that found no node: on the
+        ; files traced so far every one of those was a variant that is not
+        ; the one shown or a layer hidden in the component, neither of
+        ; which Figma draws either (`FigToScene` has the tally). It is a
+        ; tripwire rather than a fault — a file where the gap is wide is a
+        ; file to look at — but `used` at zero with `seen` above it is a
+        ; real one: the instances are showing their placeholder text.
+        o = (o + ",\"overridesSeen\":" + (to_string converter.overridesSeen))
+        o = (o + ",\"overridesUsed\":" + (to_string converter.overridesUsed))
+        o = (o + ",\"overridesUnplaced\":" + (to_string (converter.overridesSeen - converter.overridesUsed)))
+        return (o + "}")
+    }
+
+    ; Returns how many image references had no bytes behind them.
+    fn censusWalk:int (n:SceneNode types:[string] totals:[int] empties:[int]) {
+        def missing:int 0
+        def key:string n.sourceType
+        if ((strlen key) == 0) {
+            key = n.kind
+        }
+        def at:int (0 - 1)
+        def i:int 0
+        while (i < (array_length types)) {
+            if ((itemAt types i) == key) {
+                at = i
+            }
+            i = (i + 1)
+        }
+        if (at < 0) {
+            push types key
+            push totals 0
+            push empties 0
+            at = ((array_length types) - 1)
+        }
+        set totals at ((itemAt totals at) + 1)
+        if ((array_length n.children) == 0) {
+            if (FigToScene.drawsNothing(n)) {
+                set empties at ((itemAt empties at) + 1)
+            }
+        }
+        if ((strlen n.imageRef) > 0) {
+            if ((assets.hasImage(n.imageRef)) == false) {
+                missing = (missing + 1)
+            }
+        }
+        def c:int 0
+        while (c < (array_length n.children)) {
+            missing = (missing + (this.censusWalk((itemAt n.children c) types totals empties)))
+            c = (c + 1)
+        }
+        return missing
+    }
+
+    ; Everything the file carries that the converter never reads, counted.
+    ; A warning can only report a case someone thought of; when a page comes
+    ; out wrong and nothing is reported, what is missing is by definition
+    ; what nobody wrote a warning for. This asks it the other way round.
+    fn unreadJson:string () {
+        def rep (new FigFieldReport())
+        rep.scan(doc)
+        def o:string "["
+        def i:int 0
+        while (i < (array_length rep.uses)) {
+            if (i > 0) {
+                o = (o + ",")
+            }
+            def u:FigFieldUse (itemAt rep.uses i)
+            o = (o + "{\"field\":\"" + (this.esc(u.name)) + "\"")
+            o = (o + ",\"count\":" + (to_string u.count))
+            o = (o + ",\"note\":\"" + (this.esc(u.note)) + "\"")
+            o = (o + ",\"id\":\"" + (this.esc(u.exampleId)) + "\"")
+            o = (o + ",\"name\":\"" + (this.esc(u.exampleName)) + "\"}")
+            i = (i + 1)
+        }
+        return (o + "]")
+    }
+
+    fn warningsJson:string () {
+        def o:string "["
+        def i:int 0
+        while (i < (array_length sceneDoc.warnings)) {
+            if (i > 0) {
+                o = (o + ",")
+            }
+            def w:SceneWarn (itemAt sceneDoc.warnings i)
+            o = (o + "{\"id\":\"" + (this.esc(w.nodeId)) + "\",\"name\":\"" + (this.esc(w.nodeName)) + "\",\"feature\":\"" + (this.esc(w.feature)) + "\"}")
+            i = (i + 1)
+        }
+        return (o + "]")
+    }
+
+    fn imageCount:int () {
+        return (array_length doc.images)
+    }
+
+    fn imageName:string (i:int) {
+        if ((i < 0) || (i >= (array_length doc.images))) {
+            return ""
+        }
+        def im:FigImage (itemAt doc.images i)
+        return im.name
+    }
+
+    fn imageBytes:buffer (name:string) {
+        def im:FigImage (doc.imageByName(name))
+        return im.bytes
+    }
+
+    fn esc:string (s:string) {
+        def v (new KiwiValue())
+        return (v.jsonEscape(s))
+    }
+}

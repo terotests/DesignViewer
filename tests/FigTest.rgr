@@ -1,0 +1,1846 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+Import "../src/KiwiBuffer.rgr"
+Import "../src/KiwiSchema.rgr"
+Import "../src/KiwiDecode.rgr"
+Import "../src/KiwiValue.rgr"
+Import "../src/FigParser.rgr"
+Import "../src/FigSample.rgr"
+Import "../src/convert/FigToScene.rgr"
+Import "../src/write/SceneToFig.rgr"
+Import "../src/write/EvgToScene.rgr"
+Import "../src/write/FigSchema.rgr"
+Import "../src/write/FigVectorNet.rgr"
+Import "../src/write/FigFonts.rgr"
+Import "../../zip/ZipReader.rgr"
+Import "../src/write/FigPathWrite.rgr"
+Import "../src/FigPath.rgr"
+Import "pkg:evg/EVGImageDecode.rgr"
+Import "pkg:evg/EVGCodepoint.rgr"
+Import "../src/FigApp.rgr"
+Import "../src/FigDeflate.rgr"
+Import "../src/convert/FigToScene.rgr"
+Import "../src/evg/SceneToEVG.rgr"
+Import "../src/scene/SceneNode.rgr"
+Import "../../../lib/zip/Inflate.rgr"
+
+class FigTest {
+    def passed:int 0
+    def failed:int 0
+
+    sfn main:void () {
+        def t (new FigTest())
+        t.run()
+    }
+
+    fn check:void (name:string cond:boolean) {
+        if cond {
+            passed = (passed + 1)
+            print ("  PASS  " + name)
+        } {
+            failed = (failed + 1)
+            print ("  FAIL  " + name)
+        }
+    }
+
+    fn eqInt:void (name:string got:int want:int) {
+        this.check((name + " (got " + (to_string got) + " want " + (to_string want) + ")") (got == want))
+    }
+
+    fn eqStr:void (name:string got:string want:string) {
+        this.check((name + " (got '" + got + "' want '" + want + "')") (got == want))
+    }
+
+    fn close:void (name:string got:double want:double) {
+        def d:double (got - want)
+        if (d < 0.0) {
+            d = (0.0 - d)
+        }
+        this.check((name + " (got " + (to_string got) + " want " + (to_string want) + ")") (d < 0.02))
+    }
+
+
+    ; --- writing -------------------------------------------------------------
+    ;
+    ; The reader has always been the tested half. These ask the other question:
+    ; does a file this repository WRITES come back through the same reader
+    ; saying what it was told?
+
+    fn testRewrite:void () {
+        print "--- read a .fig, write it, read it again ---"
+        def bytes:buffer (FigSample.buildFig())
+        def p (new FigParser())
+        def doc:FigDoc (p.parseBytes(bytes "sample.fig"))
+        this.check("the original parsed" doc.ok)
+        def conv (new FigToScene())
+        def scene:SceneDocument (conv.convertDoc(doc))
+        this.eqInt("pages in" (array_length scene.pages) 3)
+
+        def w (new SceneToFig())
+        def out:buffer (w.toBytes(scene "round.fig"))
+        this.check("wrote something" ((buffer_length out) > 100))
+
+        def p2 (new FigParser())
+        def back:FigDoc (p2.parseBytes(out "round.fig"))
+        this.check(("the written file parsed " + back.err) back.ok)
+        this.eqStr("prelude survives" back.prelude "fig-kiwi")
+        this.eqInt("pages survive" (array_length back.pages) 3)
+        ; NOT the same node count, and that is not a defect. `FigToScene`
+        ; resolves as it reads — an instance is expanded into the nodes it
+        ; stands for, a mask becomes a group, a stroke that is geometry gets its
+        ; own outline node. The scene is the RENDERED form, so writing it back
+        ; produces a file that draws the same and is built differently. The
+        ; round trip preserves the picture, never the structure.
+        def wrote:int (array_length back.nodes)
+        def had:int (array_length doc.nodes)
+        def note:string ((("written " + (to_string wrote)) + " from ") + (to_string had))
+        this.check((note + " — the scene is expanded, so at least as many") (wrote >= had))
+
+        ; The shapes are the point: `kind` normalises an ELLIPSE to a container,
+        ; and only `sourceType` can put it back.
+        def p0:FigNode (back.pageAt(0))
+        this.eqStr("page name" p0.name "Welcome")
+        def card:FigNode (itemAt p0.children 0)
+        this.eqStr("frame" card.typeName "FRAME")
+        this.eqStr("frame name" card.name "Card")
+        def kinds:string ""
+        def i:int 0
+        while (i < (array_length card.children)) {
+            def kid:FigNode (itemAt card.children i)
+            kinds = ((kinds + kid.typeName) + " ")
+            i = (i + 1)
+        }
+        this.check(("an ellipse is still an ellipse: " + kinds) ((indexOf kinds "ELLIPSE") >= 0))
+        this.check(("a rounded rect too: " + kinds) ((indexOf kinds "ROUNDED_RECTANGLE") >= 0))
+        this.check(("and the text: " + kinds) ((indexOf kinds "TEXT") >= 0))
+    }
+
+    fn testEvgToFig:void () {
+        print "--- an EVG document, written as a .fig ---"
+        def root:EVGElement (EVGElement.createDiv())
+        root.setAttribute("width" "400px")
+        root.setAttribute("height" "300px")
+        root.markInline("width")
+        root.markInline("height")
+        def card:EVGElement (EVGElement.createDiv())
+        card.id = "card"
+        card.setAttribute("width" "200px")
+        card.setAttribute("height" "100px")
+        card.setAttribute("background-color" "rgb(255,0,0)")
+        card.setAttribute("border-radius" "8px")
+        card.markInline("width")
+        card.markInline("height")
+        card.markInline("background-color")
+        card.markInline("border-radius")
+        def label:EVGElement (EVGElement.createSpan())
+        label.textContent = "Hello"
+        card.addChild(label)
+        root.addChild(card)
+
+        def conv (new EvgToScene())
+        def scene:SceneNode (conv.build(root))
+        this.eqInt("one child" (array_length scene.children) 1)
+        def sc:SceneNode (itemAt scene.children 0)
+        this.eqStr("named from the id" sc.name "card")
+        ; It holds the label, so it is a frame — a Figma frame is what a box
+        ; with children is, whatever its corners.
+        this.eqStr("a box with children is a frame" sc.sourceType "FRAME")
+        this.check("it has a fill" ((array_length sc.fills) > 0))
+
+        ; EVG counts a channel 0..255 and a scene counts it 0..1. Getting this
+        ; wrong wrote a file that inspected perfectly and rendered blank.
+        def f:SceneFill (itemAt sc.fills 0)
+        this.check(("red is a fraction, not 255: " + (to_string f.r)) ((f.r > 0.99) && (f.r < 1.01)))
+        this.check("and green is nearly nothing" (f.g < 0.01))
+
+        ; …and a childless rounded box is a rounded rectangle.
+        def pill:EVGElement (EVGElement.createDiv())
+        pill.setAttribute("width" "40px")
+        pill.setAttribute("height" "40px")
+        pill.setAttribute("border-radius" "20px")
+        pill.markInline("width")
+        pill.markInline("height")
+        pill.markInline("border-radius")
+        root.addChild(pill)
+        def conv2 (new EvgToScene())
+        def scene2:SceneNode (conv2.build(root))
+        def pillNode:SceneNode (itemAt scene2.children 1)
+        this.eqStr("a rounded rectangle" pillNode.sourceType "ROUNDED_RECTANGLE")
+
+        def bytes:buffer (SceneToFig.writeNode(scene "from-evg.fig"))
+        def p (new FigParser())
+        def back:FigDoc (p.parseBytes(bytes "from-evg.fig"))
+        this.check(("it parsed " + back.err) back.ok)
+        this.eqInt("one page" (array_length back.pages) 1)
+        def page:FigNode (back.pageAt(0))
+        this.check("the page has content" ((array_length page.children) > 0))
+    }
+
+    ; THE SCHEMA A WRITTEN FILE DECLARES, AGAINST A REAL EXPORT.
+    ;
+    ; A `.fig` carries its own schema and Figma reads the file through it, by
+    ; NAME: a type this repository invented is a type Figma cannot map onto
+    ; anything, and a struct declared as a message is a different wire format
+    ; under a name Figma thinks it knows. The first file written from here had
+    ; both — a message called `Node`, and `Vector`, `Color`, `ParentIndex` and
+    ; `Blob` as messages — and Figma answered "internal error", which is all it
+    ; can say about a file that is well-formed and describes nothing.
+    ;
+    ; Nothing in this repository could have caught that, because both sides of
+    ; the round trip were ours. `fixtures/health.fig` is a real export, and its
+    ; schema is the only ground truth here: every type and field the writer
+    ; declares must exist in it, with the same kind, the same id and the same
+    ; type.
+    fn testWrittenSchemaMatchesFigma:void () {
+        print "-- the written schema, against Figma's own --"
+        def bytes:buffer (buffer_read_file "gallery/figma/fixtures" "health.fig")
+        def p (new FigParser())
+        def doc:FigDoc (p.parseBytes(bytes "health.fig"))
+        this.check(("the fixture parsed " + doc.err) doc.ok)
+        def real:KiwiSchema p.schema
+        this.check("and it carries a schema" ((array_length real.defs) > 100))
+        def mine:KiwiSchema (FigSchema.schema())
+        this.check("the writer declares some types" ((array_length mine.defs) > 10))
+
+        def missingTypes:string ""
+        def wrongKinds:string ""
+        def missingFields:string ""
+        def wrongTypes:string ""
+        def wrongIds:string ""
+        def i:int 0
+        while (i < (array_length mine.defs)) {
+            def d:KiwiDef (itemAt mine.defs i)
+            def at:int (real.findDef(d.name))
+            if (at < 0) {
+                missingTypes = ((missingTypes + " ") + d.name)
+            } {
+                def rd:KiwiDef (itemAt real.defs at)
+                if (d.kind != rd.kind) {
+                    wrongKinds = ((((wrongKinds + " ") + d.name) + ":") + ((to_string d.kind) + "/" + (to_string rd.kind)))
+                }
+                def j:int 0
+                while (j < (array_length d.fields)) {
+                    def f:KiwiField (itemAt d.fields j)
+                    def rf:KiwiField (FigTest.fieldNamed(rd f.name))
+                    if ((strlen rf.name) == 0) {
+                        missingFields = ((((missingFields + " ") + d.name) + ".") + f.name)
+                    } {
+                        if (f.value != rf.value) {
+                            wrongIds = ((((((wrongIds + " ") + d.name) + ".") + f.name) + ":") + ((to_string f.value) + "/" + (to_string rf.value)))
+                        }
+                        ; An enum member has no type; a field does.
+                        if (d.kind != 0) {
+                            if (f.typeName != rf.typeName) {
+                                wrongTypes = ((((((wrongTypes + " ") + d.name) + ".") + f.name) + ":") + (f.typeName + "/" + rf.typeName))
+                            }
+                        }
+                    }
+                    j = (j + 1)
+                }
+            }
+            i = (i + 1)
+        }
+        this.check(("every type is one Figma knows:" + missingTypes) ((strlen missingTypes) == 0))
+        this.check(("and declared the same way (ours/theirs):" + wrongKinds) ((strlen wrongKinds) == 0))
+        this.check(("every field exists there:" + missingFields) ((strlen missingFields) == 0))
+        this.check(("with the same id:" + wrongIds) ((strlen wrongIds) == 0))
+        this.check(("and the same type:" + wrongTypes) ((strlen wrongTypes) == 0))
+    }
+
+    sfn u32At:int (b:buffer at:int) {
+        def v:int (buffer_get b at)
+        v = (v + ((buffer_get b (at + 1)) * 256))
+        v = (v + ((buffer_get b (at + 2)) * 65536))
+        v = (v + ((buffer_get b (at + 3)) * 16777216))
+        return v
+    }
+
+    sfn listHas:boolean (names:[string] want:string) {
+        def i:int 0
+        while (i < (array_length names)) {
+            if ((itemAt names i) == want) {
+                return true
+            }
+            i = (i + 1)
+        }
+        return false
+    }
+
+    sfn fieldNamed:KiwiField (d:KiwiDef name:string) {
+        def i:int 0
+        while (i < (array_length d.fields)) {
+            def f:KiwiField (itemAt d.fields i)
+            if (f.name == name) {
+                return f
+            }
+            i = (i + 1)
+        }
+        return (new KiwiField())
+    }
+
+    ; A UI is icons and labels with backgrounds behind them, and both were
+    ; missing from the first app exported through this door: the icons because
+    ; an embedded SVG document is not a `d` attribute, the pills because a
+    ; Figma text node's fills are its LETTERS.
+    fn testUiSurvives:void () {
+        print "-- a UI: pills, icons, and the page it was drawn for --"
+        def root:EVGElement (EVGElement.createDiv())
+        root.setAttribute("width" "100%")
+        root.setAttribute("height" "100%")
+        root.markInline("width")
+        root.markInline("height")
+
+        ; A tag pill: a string AND a background.
+        def tag:EVGElement (EVGElement.createDiv())
+        tag.id = "tag"
+        tag.textContent = "kuntosali"
+        tag.setAttribute("width" "80px")
+        tag.setAttribute("height" "20px")
+        tag.setAttribute("background-color" "rgb(20,53,31)")
+        tag.setAttribute("color" "rgb(74,222,128)")
+        tag.setAttribute("border-radius" "10px")
+        tag.markInline("width")
+        tag.markInline("height")
+        tag.markInline("background-color")
+        tag.markInline("color")
+        tag.markInline("border-radius")
+        root.addChild(tag)
+
+        ; An icon: a picture written as a document rather than as one outline.
+        def icon:EVGElement (EVGElement.createDiv())
+        icon.id = "icon"
+        icon.setAttribute("width" "20px")
+        icon.setAttribute("height" "20px")
+        icon.markInline("width")
+        icon.markInline("height")
+        icon.svgSource = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M4 4 L20 4 L20 20 Z' fill='#ff8800'/></svg>"
+        root.addChild(icon)
+
+        def conv (new EvgToScene())
+        ; The document says `100%` of a window it does not name.
+        conv.pageW = 430.0
+        conv.pageH = 932.0
+        def scene:SceneNode (conv.build(root))
+        this.check("laid out on the page it was given" ((scene.w > 429.0) && (scene.w < 431.0)))
+
+        def tagNode:SceneNode (itemAt scene.children 0)
+        this.eqStr("a pill is a frame" tagNode.sourceType "FRAME")
+        this.check("with its background" ((array_length tagNode.fills) > 0))
+        this.eqInt("and the string inside it" (array_length tagNode.children) 1)
+        def inner:SceneNode (itemAt tagNode.children 0)
+        this.eqStr("which is the text" inner.kind "text")
+        this.eqStr("with the characters" inner.text.characters "kuntosali")
+        ; The pill is dark and the letters are light: the two fills must not
+        ; be the same one.
+        def pillFill:SceneFill (itemAt tagNode.fills 0)
+        def inkFill:SceneFill (itemAt inner.fills 0)
+        this.check("the letters are not the pill" (inkFill.g > pillFill.g))
+
+        def iconNode:SceneNode (itemAt scene.children 1)
+        this.check("the icon has shapes" ((array_length iconNode.children) > 0))
+        def shape:SceneNode (itemAt iconNode.children 0)
+        this.eqStr("drawn as vector" shape.kind "path")
+        ; A NETWORK, not only geometry. `fillGeometry` is the flattened answer
+        ; Figma keeps beside the vector network it actually draws from, so a
+        ; node with the geometry alone opens as an empty box — which is what
+        ; every icon of the first UI exported from here did.
+        def net:buffer (FigVectorNet.fromSvg(shape.pathData))
+        this.check("the outline makes a vector network" ((buffer_length net) > 12))
+        ; Its header counts what is in it, little-endian.
+        def verts:int (FigTest.u32At(net 0))
+        def segs:int (FigTest.u32At(net 4))
+        def regions:int (FigTest.u32At(net 8))
+        this.eqInt("one region" regions 1)
+        this.check("some vertices" (verts > 2))
+        this.check("and segments joining them" (segs > 2))
+        ; vertices 12 bytes each, segments 28, then the region.
+        def after:int ((12 + (verts * 12)) + (segs * 28))
+        this.check("the blob is exactly as long as its parts" ((buffer_length net) > after))
+
+        ; A font Figma can find. `Arial` is a system font: a file that asks for
+        ; it opens with a missing-font dialog in front of the drawing.
+        this.eqStr("Arial is written as Inter" (FigFonts.figmaFamily("Arial")) "Inter")
+        this.eqStr("and so is a stack that starts with it" (FigFonts.figmaFamily("\"Segoe UI\", Arial, sans-serif")) "Inter")
+        this.eqStr("a monospace family" (FigFonts.figmaFamily("Menlo")) "Roboto Mono")
+        ; …and a font Figma hosts is left alone.
+        this.eqStr("Open Sans is passed through" (FigFonts.figmaFamily("Open Sans")) "Open Sans")
+        this.check("with geometry" ((strlen shape.pathData) > 0))
+        this.check("and paint" ((array_length shape.fills) > 0))
+        ; Scaled from the document's 24x24 into the icon's 20x20 box: nothing
+        ; may reach outside it.
+        this.check("inside its box" ((shape.pathW > 19.0) && (shape.pathW < 21.0)))
+        this.eqInt("nothing reported lost" (array_length conv.losses) 0)
+
+        ; A one-line label is sized BY its string, so whoever opens the file
+        ; does not re-break it against a face this layout never measured.
+        this.eqStr("a label sizes itself" inner.text.autoResize "both")
+
+        ; …and the ARCHIVE has everything a reader looks up by name. A file
+        ; with the document and nothing else imported as "Cannot read
+        ; properties of undefined (reading 'getData')" — a lookup that found
+        ; no thumbnail, not a document that was wrong.
+        def archive:buffer (SceneToFig.writeNode(scene "ui.fig"))
+        def zr (new ZipReader())
+        this.check("the archive opens" (zr.openBytes(archive)))
+        def names:[string] (zr.listFiles())
+        this.check("canvas.fig" (FigTest.listHas(names "canvas.fig")))
+        this.check("thumbnail.png" (FigTest.listHas(names "thumbnail.png")))
+        this.check("meta.json" (FigTest.listHas(names "meta.json")))
+        def te@(optional):ZipEntry (zr.getEntry("thumbnail.png"))
+        this.check("the thumbnail is an entry" ((null? te) == false))
+        def thumb:buffer (zr.extract((unwrap te)))
+        this.check("the thumbnail has bytes" ((buffer_length thumb) > 64))
+        ; A PNG, and one a decoder will take: the signature, and an IHDR whose
+        ; size is the one `meta.json` claims.
+        this.eqInt("PNG signature" (buffer_get thumb 0) 137)
+        this.eqInt("P" (buffer_get thumb 1) 80)
+        this.eqInt("N" (buffer_get thumb 2) 78)
+        this.eqInt("G" (buffer_get thumb 3) 71)
+
+        ; …and it survives the file, with nothing the schema cannot hold.
+        def dropped:[string]
+        def bytes:buffer (SceneToFig.writeNodeReporting(scene "ui.fig" dropped))
+        def p (new FigParser())
+        def back:FigDoc (p.parseBytes(bytes "ui.fig"))
+        this.check(("it parsed " + back.err) back.ok)
+        ; Encoding walks the SCHEMA, so a field nobody declared is written and
+        ; then dropped without a word. `textAutoResize` and `lineHeight` were
+        ; exactly that until the schema grew them.
+        def names:string ""
+        def dj:int 0
+        while (dj < (array_length dropped)) {
+            names = ((names + " ") + (itemAt dropped dj))
+            dj = (dj + 1)
+        }
+        this.check(("the schema holds every field written:" + names) ((array_length dropped) == 0))
+    }
+
+    fn testWriterReportsWhatItCannotCarry:void () {
+        print "--- the writer says what it dropped ---"
+        ; Paths used to be the example here. They are carried now, so the test
+        ; moved to something that still is not: an image names bytes that live
+        ; in the archive, and the archive is not written.
+        def root:EVGElement (EVGElement.createDiv())
+        root.setAttribute("width" "200px")
+        root.setAttribute("height" "200px")
+        root.markInline("width")
+        root.markInline("height")
+        def pic:EVGElement (EVGElement.createImg())
+        pic.setAttribute("src" "photo.jpg")
+        pic.setAttribute("width" "50px")
+        pic.setAttribute("height" "50px")
+        pic.markInline("src")
+        root.addChild(pic)
+        def conv (new EvgToScene())
+        def scene:SceneNode (conv.build(root))
+        this.check("an image is reported, not dropped in silence" ((array_length conv.losses) > 0))
+
+        ; And a path is NOT reported, because nothing about it is lost.
+        def clean:EVGElement (EVGElement.createDiv())
+        clean.setAttribute("width" "200px")
+        clean.setAttribute("height" "200px")
+        clean.markInline("width")
+        clean.markInline("height")
+        def shape:EVGElement (EVGElement.createPath())
+        shape.setAttribute("d" "M 0 0 L 10 0 L 10 10 Z")
+        shape.setAttribute("width" "10px")
+        shape.setAttribute("height" "10px")
+        shape.markInline("d")
+        shape.markInline("width")
+        shape.markInline("height")
+        clean.addChild(shape)
+        def conv2 (new EvgToScene())
+        def scene2:SceneNode (conv2.build(clean))
+        this.eqInt("a carried path is not complained about" (array_length conv2.losses) 0)
+    }
+
+
+    fn testPathBlobRoundTrip:void () {
+        print "--- an outline, encoded and decoded again ---"
+        ; Straight through the reader's own decoder, which is the only check
+        ; worth making on an encoder: the bytes mean what `FigPath` says they
+        ; mean, or they do not.
+        def blob:buffer (FigPathWrite.fromSvg("M 10 20 L 110 20 L 110 70 Z"))
+        this.check("it produced bytes" ((buffer_length blob) > 0))
+        def rings:[FigPathRing]
+        FigPath.decode(blob rings)
+        this.eqInt("one ring" (array_length rings) 1)
+        def r:FigPathRing (itemAt rings 0)
+        def pts:int (idiv (array_length r.pts) 2)
+        this.check(("points " + (to_string pts)) (pts >= 3))
+        this.check("first x" (((itemAt r.pts 0) > 9.9) && ((itemAt r.pts 0) < 10.1)))
+        this.check("first y" (((itemAt r.pts 1) > 19.9) && ((itemAt r.pts 1) < 20.1)))
+
+        ; A curve has to survive too — the reader flattens it, so the test is
+        ; that it arrives as many points and ends where it was told to.
+        def curved:buffer (FigPathWrite.fromSvg("M 0 0 C 0 50 50 50 50 0"))
+        def rings2:[FigPathRing]
+        FigPath.decode(curved rings2)
+        this.eqInt("one ring for the curve" (array_length rings2) 1)
+        def r2:FigPathRing (itemAt rings2 0)
+        def pts2:int (idiv (array_length r2.pts) 2)
+        this.check(("a curve flattens to several points, got " + (to_string pts2)) (pts2 > 4))
+        def lastX:double (itemAt r2.pts ((array_length r2.pts) - 2))
+        this.check(("it ends at x=50, got " + (to_string lastX)) ((lastX > 49.0) && (lastX < 51.0)))
+
+        this.eqInt("nothing in, nothing out" (buffer_length (FigPathWrite.fromSvg(""))) 0)
+    }
+
+    fn testVectorKeepsItsShape:void () {
+        print "--- a vector written with its geometry ---"
+        def root:EVGElement (EVGElement.createDiv())
+        root.setAttribute("width" "200px")
+        root.setAttribute("height" "200px")
+        root.markInline("width")
+        root.markInline("height")
+        def shape:EVGElement (EVGElement.createPath())
+        shape.setAttribute("d" "M 0 0 L 100 0 L 100 100 Z")
+        shape.setAttribute("width" "100px")
+        shape.setAttribute("height" "100px")
+        shape.setAttribute("fill" "rgb(0,128,0)")
+        shape.markInline("d")
+        shape.markInline("width")
+        shape.markInline("height")
+        shape.markInline("fill")
+        root.addChild(shape)
+
+        def conv (new EvgToScene())
+        def scene:SceneNode (conv.build(root))
+        def sn:SceneNode (itemAt scene.children 0)
+        this.eqStr("it is a vector" sn.sourceType "VECTOR")
+        this.check("the outline came across" ((strlen sn.pathData) > 0))
+        ; A path is painted by `fill`, not by `background-color`. Reading the
+        ; box's field here wrote a shape with geometry and no paint, which
+        ; renders as nothing and looks exactly like geometry that failed.
+        this.check("and so did the paint" ((array_length sn.fills) > 0))
+        def f:SceneFill (itemAt sn.fills 0)
+        this.check(("green as a fraction, got " + (to_string f.g)) ((f.g > 0.49) && (f.g < 0.51)))
+
+        def bytes:buffer (SceneToFig.writeNode(scene "vector.fig"))
+        def p (new FigParser())
+        def back:FigDoc (p.parseBytes(bytes "vector.fig"))
+        this.check(("it parsed " + back.err) back.ok)
+        this.check("the geometry blob rode along" ((array_length back.blobs) > 0))
+    }
+
+
+    fn testGradientSurvives:void () {
+        print "--- a gradient, read and written again ---"
+        def bytes:buffer (FigSample.buildFig())
+        def p (new FigParser())
+        def doc:FigDoc (p.parseBytes(bytes "sample.fig"))
+        def conv (new FigToScene())
+        def scene:SceneDocument (conv.convertDoc(doc))
+
+        def found:SceneFill (FigTest.firstGradient(scene))
+        this.check("the sample has a gradient to test with" (found.kind == "gradient"))
+        this.check("its first end is set" ((found.r + found.g + found.b) > 0.0))
+        this.check("and its last end differs" (((found.gradR != found.r) || (found.gradG != found.g)) || (found.gradB != found.b)))
+
+        def w (new SceneToFig())
+        def out:buffer (w.toBytes(scene "grad.fig"))
+        def p2 (new FigParser())
+        def back:FigDoc (p2.parseBytes(out "grad.fig"))
+        this.check(("it parsed " + back.err) back.ok)
+        def conv2 (new FigToScene())
+        def scene2:SceneDocument (conv2.convertDoc(back))
+        def again:SceneFill (FigTest.firstGradient(scene2))
+        ; Written as a solid, this comes back "solid" — which is what it did
+        ; before the writer learned the stops.
+        this.eqStr("it is still a gradient" again.kind "gradient")
+        this.check(("first end survives, got " + (to_string again.r)) ((FigTest.near(again.r found.r)) && (FigTest.near(again.g found.g))))
+        this.check(("last end survives, got " + (to_string again.gradR)) ((FigTest.near(again.gradR found.gradR)) && (FigTest.near(again.gradB found.gradB))))
+    }
+
+    sfn near:boolean (a:double b:double) {
+        def d:double (a - b)
+        if (d < 0.0) {
+            d = (0.0 - d)
+        }
+        return (d < 0.01)
+    }
+
+    sfn firstGradient:SceneFill (doc:SceneDocument) {
+        def i:int 0
+        while (i < (array_length doc.pages)) {
+            def hit:SceneFill (FigTest.gradientIn((itemAt doc.pages i)))
+            if (hit.kind == "gradient") {
+                return hit
+            }
+            i = (i + 1)
+        }
+        return (new SceneFill())
+    }
+
+    sfn gradientIn:SceneFill (n:SceneNode) {
+        def f:int 0
+        while (f < (array_length n.fills)) {
+            def fill:SceneFill (itemAt n.fills f)
+            if (fill.kind == "gradient") {
+                return fill
+            }
+            f = (f + 1)
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            def hit:SceneFill (FigTest.gradientIn((itemAt n.children i)))
+            if (hit.kind == "gradient") {
+                return hit
+            }
+            i = (i + 1)
+        }
+        return (new SceneFill())
+    }
+
+
+    ; One decoder, three formats. The raster tool used to pick between the two
+    ; JPEG decoders itself and had never heard of PNG — which a Figma archive
+    ; is full of, so a converted page rendered "Not a JPEG file (missing SOI)".
+    fn testImageSniffing:void () {
+        print "--- what kind of picture is this ---"
+        def png:buffer (FigSample.png1x1())
+        def got@(optional):ImageBuffer (EVGImageDecode.decode(png))
+        this.check("a PNG decodes" ((null? got) == false))
+        if ((null? got) == false) {
+            def im:ImageBuffer (unwrap got)
+            this.check(("it has a size, got " + ((to_string im.width) + "x" + (to_string im.height))) ((im.width > 0) && (im.height > 0)))
+        }
+
+        ; The JPEG branch chooses between baseline and progressive from the SOF
+        ; marker rather than from a name. Sending a progressive file to the
+        ; baseline decoder is not an error, it is a picture that never arrives.
+        def baseline:buffer (buffer_alloc 8)
+        buffer_set baseline 0 255
+        buffer_set baseline 1 216
+        buffer_set baseline 2 255
+        buffer_set baseline 3 192
+        this.check("SOF0 reads as baseline" ((EVGImageDecode.isProgressive(baseline)) == false))
+        def prog:buffer (buffer_alloc 8)
+        buffer_set prog 0 255
+        buffer_set prog 1 216
+        buffer_set prog 2 255
+        buffer_set prog 3 194
+        this.check("SOF2 reads as progressive" (EVGImageDecode.isProgressive(prog)))
+
+        def junk:buffer (buffer_alloc 8)
+        def nothing@(optional):ImageBuffer (EVGImageDecode.decode(junk))
+        this.check("and something that is neither is refused" (null? nothing))
+    }
+
+    fn run:void () {
+        print "=== FigTest ==="
+        this.testVarint()
+        this.testVarfloat()
+        this.testSchema()
+        this.testMessage()
+        this.testStoredDeflate()
+        this.testSampleFig()
+        this.testViewer()
+        this.testSceneIr()
+        this.testInspector()
+        this.testFixtures()
+        this.testHealthFig()
+        this.testPaste()
+        this.testArcs()
+        this.testMask()
+        this.testPerSideStroke()
+        this.testTracking()
+        this.testDashAndCaps()
+        this.testRotationAngle()
+        this.testRewrite()
+        this.testEvgToFig()
+        this.testWriterReportsWhatItCannotCarry()
+        this.testUiSurvives()
+        this.testWrittenSchemaMatchesFigma()
+        this.testPathBlobRoundTrip()
+        this.testVectorKeepsItsShape()
+        this.testGradientSurvives()
+        this.testImageSniffing()
+        print ""
+        print ("passed = " + (to_string passed) + "  failed = " + (to_string failed))
+        if (failed == 0) {
+            print "ALL PASS"
+        } {
+            print "SOME FAILED"
+        }
+    }
+
+    ; The arc tool: a wedge, a ring and a ring's slice. Drawn as its whole
+    ; ellipse — which is what the reader did before `arcData` was read — a
+    ; twenty-degree slice puts eighteen times the ink on the page, so the
+    ; shape of the path matters more here than its last decimal.
+    fn testArcs:void () {
+        print "--- arcs ---"
+        def full (new KiwiValue())
+        full.kind = 6
+        full.put("startingAngle" (KiwiValue.fromDouble(0.0)))
+        full.put("endingAngle" (KiwiValue.fromDouble(6.283185307179586)))
+        full.put("innerRadius" (KiwiValue.fromDouble(0.0)))
+        this.eqStr("a whole turn with no hole is the plain ellipse" (FigToScene.arcPath(100.0 100.0 full)) (FigToScene.ellipsePath(100.0 100.0)))
+
+        def quarter (new KiwiValue())
+        quarter.kind = 6
+        quarter.put("startingAngle" (KiwiValue.fromDouble(0.0)))
+        quarter.put("endingAngle" (KiwiValue.fromDouble(1.5707963267948966)))
+        quarter.put("innerRadius" (KiwiValue.fromDouble(0.0)))
+        def q:string (FigToScene.arcPath(100.0 100.0 quarter))
+        print ("    wedge: " + q)
+        this.check("a wedge closes through the middle" ((FigTest.countOf(q "L")) == 1))
+        this.check("and is one subpath" ((FigTest.countOf(q "M")) == 1))
+        this.check("swept a quarter, it is not the long way round" ((FigTest.countOf(q " 0 1 ")) == 1))
+
+        def ring (new KiwiValue())
+        ring.kind = 6
+        ring.put("startingAngle" (KiwiValue.fromDouble(0.0)))
+        ring.put("endingAngle" (KiwiValue.fromDouble(6.283185307179586)))
+        ring.put("innerRadius" (KiwiValue.fromDouble(0.5)))
+        def r:string (FigToScene.arcPath(100.0 100.0 ring))
+        print ("    ring: " + r)
+        this.check("a ring is two subpaths" ((FigTest.countOf(r "M")) == 2))
+        this.check("the outer edge runs one way" ((FigTest.countOf(r "A50 50 0 0 1 ")) == 2))
+        this.check("and the hole the other" ((FigTest.countOf(r "A25 25 0 0 0 ")) == 2))
+
+        def slice (new KiwiValue())
+        slice.kind = 6
+        slice.put("startingAngle" (KiwiValue.fromDouble(0.0)))
+        slice.put("endingAngle" (KiwiValue.fromDouble(4.71238898038469)))
+        slice.put("innerRadius" (KiwiValue.fromDouble(0.5)))
+        def sl:string (FigToScene.arcPath(100.0 100.0 slice))
+        print ("    slice: " + sl)
+        this.check("a ring's slice is one subpath" ((FigTest.countOf(sl "M")) == 1))
+        this.check("with an edge on each side" ((FigTest.countOf(sl "L")) == 1))
+        this.check("three quarters takes the long way" ((FigTest.countOf(sl " 1 1 ")) == 1))
+
+        ; And the same through the whole reader, from the file's own
+        ; bytes: the node is an ELLIPSE and comes out as a ring's slice.
+        def app (new FigApp())
+        this.check("open sample" (app.openSample()))
+        app.setPage(2)
+        def ring:SceneNode ((app.currentPage()).childNamed("ArcRing"))
+        this.check("cut, not a whole ellipse" ((FigTest.countOf(ring.pathData "L")) == 1))
+        this.check("and hollow" ((FigTest.countOf(ring.pathData "A25 25")) == 1))
+
+        def none (new KiwiValue())
+        none.kind = 6
+        none.put("startingAngle" (KiwiValue.fromDouble(1.0)))
+        none.put("endingAngle" (KiwiValue.fromDouble(1.0)))
+        none.put("innerRadius" (KiwiValue.fromDouble(0.0)))
+        this.eqStr("nothing swept is nothing drawn" (FigToScene.arcPath(100.0 100.0 none)) "")
+
+        def back (new KiwiValue())
+        back.kind = 6
+        back.put("startingAngle" (KiwiValue.fromDouble(1.5707963267948966)))
+        back.put("endingAngle" (KiwiValue.fromDouble(0.0)))
+        back.put("innerRadius" (KiwiValue.fromDouble(0.0)))
+        this.eqStr("a sweep given backwards is the same wedge" (FigToScene.arcPath(100.0 100.0 back)) q)
+    }
+
+    ; A masking layer becomes the clip around what it masks, and stops
+    ; being a shape of its own.
+    fn testMask:void () {
+        print "--- masks ---"
+        def app (new FigApp())
+        this.check("open sample" (app.openSample()))
+        app.setPage(2)
+        def page:SceneNode (app.currentPage())
+        def grp:SceneNode (page.childNamed("MaskedGroup"))
+        this.eqInt("the mask and its bar became one child" (array_length grp.children) 1)
+        def clip:SceneNode (itemAt grp.children 0)
+        this.eqStr("named after the mask" clip.name "MaskShape (mask)")
+        this.check("and it clips" clip.clip)
+        this.eqInt("to the mask's box" (to_int clip.w) 80)
+        this.eqInt("at the mask's corner" (to_int clip.x) 10)
+        this.eqInt("holding the layer it masked" (array_length clip.children) 1)
+        def bar:SceneNode (itemAt clip.children 0)
+        this.eqStr("which is the bar" bar.name "MaskedBar")
+        ; 10 in the parent, 10 in the mask: the bar sits at the mask's own
+        ; left edge, not ten past it a second time.
+        this.eqInt("re-based into the clip" (to_int bar.x) 0)
+        this.eqInt("and vertically too" (to_int bar.y) 20)
+        ; And it reaches the renderer as a box of that size that clips —
+        ; the draw commands carry it scaled by the view, so the element is
+        ; where the size can be read back.
+        def dump0:string (app.evgText())
+        this.check("the renderer gets the clip" (FigTest.hasSub(dump0 "id=\"3:71#mask\" position=\"absolute\" left=\"10px\" top=\"10px\" width=\"80px\" height=\"80px\"")))
+        this.check("the mask shape is not painted" ((FigTest.hasSub(dump0 "id=\"3:71\"")) == false))
+    }
+
+    ; A rule under a row, and nothing on the other three sides.
+    fn testPerSideStroke:void () {
+        print "--- per-side strokes ---"
+        def app (new FigApp())
+        this.check("open sample" (app.openSample()))
+        app.setPage(2)
+        def row:SceneNode ((app.currentPage()).childNamed("TableRow"))
+        def s:SceneStroke (row.firstStroke())
+        this.check("the four weights are the truth" s.perSide)
+        this.eqInt("and the rule is at the bottom" (to_int s.wBottom) 2)
+        this.eqInt("with nothing on top" (to_int s.wTop) 0)
+        def dump:string (app.evgText())
+        ; Inside alignment: the bar sits on the row's last two pixels.
+        this.check("drawn as a bar there" (FigTest.hasSub(dump "id=\"3:74:border-bottom\" position=\"absolute\" left=\"0px\" top=\"38px\" width=\"200px\" height=\"2px\"")))
+        this.check("and the other sides draw nothing" (FigTest.hasSub(dump "id=\"3:74:border-top\" position=\"absolute\" left=\"0px\" top=\"0px\" width=\"200px\" height=\"0px\"")))
+        this.check("no box around it" ((FigTest.hasSub(dump "id=\"3:74\" position=\"absolute\" left=\"4840px\" top=\"800px\" width=\"200px\" height=\"40px\" border-width=")) == false))
+    }
+
+    ; Tracking reaches the painter, because a run is drawn as one string
+    ; and nobody else can space it.
+    fn testTracking:void () {
+        print "--- letter-spacing ---"
+        def app (new FigApp())
+        this.check("open sample" (app.openSample()))
+        app.setPage(2)
+        def head:SceneNode ((app.currentPage()).childNamed("TrackedHeading"))
+        this.check("the tracking is read" (head.text.letterSpacing < (0.0 - 1.4)))
+        def scene:string (app.sceneJson())
+        this.check("and the draw command" (FigTest.hasSub(scene "\"ls\":-1.5")))
+    }
+
+    ; A dashed line with round ends, all the way to the draw command.
+    fn testDashAndCaps:void () {
+        print "--- dashes and caps ---"
+        def app (new FigApp())
+        this.check("open sample" (app.openSample()))
+        app.setPage(2)
+        def line:SceneNode ((app.currentPage()).childNamed("DashedLine"))
+        def s:SceneStroke (line.firstStroke())
+        this.eqStr("the pattern is read" s.dash "8 6")
+        this.eqStr("and the end is round" s.lineCap "round")
+        this.eqStr("and the corner too" s.lineJoin "round")
+        def scene:string (app.sceneJson())
+        this.check("the painter is told the pattern" (FigTest.hasSub(scene "\"dash\":\"8 6\"")))
+        this.check("and the cap" (FigTest.hasSub(scene "\"cap\":1")))
+    }
+
+    sfn countOf:int (s:string needle:string) {
+        def n:int (strlen s)
+        def m:int (strlen needle)
+        def hits:int 0
+        def i:int 0
+        while ((i + m) <= n) {
+            if ((substring s i (i + m)) == needle) {
+                hits = (hits + 1)
+            }
+            i = (i + 1)
+        }
+        return hits
+    }
+
+    fn testVarint:void () {
+        print "--- varint ---"
+        def bb (new KiwiBuffer())
+        bb.init((buffer_alloc 32))
+        bb.writeVarUint(0)
+        bb.writeVarUint(127)
+        bb.writeVarUint(128)
+        bb.writeVarUint(300)
+        bb.writeVarInt((0 - 1))
+        bb.writeVarInt(2)
+        def raw:buffer (bb.toBuffer())
+        def r (new KiwiBuffer())
+        r.init(raw)
+        this.eqInt("u0" (r.readVarUint()) 0)
+        this.eqInt("u127" (r.readVarUint()) 127)
+        this.eqInt("u128" (r.readVarUint()) 128)
+        this.eqInt("u300" (r.readVarUint()) 300)
+        this.eqInt("i-1" (r.readVarInt()) (0 - 1))
+        this.eqInt("i2" (r.readVarInt()) 2)
+    }
+
+    fn testVarfloat:void () {
+        print "--- varfloat ---"
+        def bb (new KiwiBuffer())
+        bb.init((buffer_alloc 32))
+        bb.writeVarFloat(0.0)
+        bb.writeVarFloat(1.0)
+        bb.writeVarFloat(2.5)
+        bb.writeVarFloat((0.0 - 4.0))
+        def raw:buffer (bb.toBuffer())
+        def r (new KiwiBuffer())
+        r.init(raw)
+        this.close("f0" (r.readVarFloat()) 0.0)
+        this.close("f1" (r.readVarFloat()) 1.0)
+        this.close("f2.5" (r.readVarFloat()) 2.5)
+        this.close("f-4" (r.readVarFloat()) (0.0 - 4.0))
+    }
+
+    fn testSchema:void () {
+        print "--- schema ---"
+        def s:KiwiSchema (FigSample.schema())
+        this.check("has Message" ((s.findDef("Message")) >= 0))
+        this.check("has Node" ((s.findDef("Node")) >= 0))
+        def raw:buffer (s.encode())
+        def s2 (new KiwiSchema())
+        this.check("decode schema" (s2.decode(raw)))
+        this.eqInt("def count" (s2.defCount()) (s.defCount()))
+        this.check("roundtrip Message" ((s2.findDef("Message")) >= 0))
+        def node:KiwiDef (s2.getDef("Node"))
+        this.check("Node is message" (node.isMessage()))
+    }
+
+    fn testMessage:void () {
+        print "--- message ---"
+        def s:KiwiSchema (FigSample.schema())
+        def msg:KiwiValue (FigSample.message())
+        def enc (new KiwiEncode())
+        enc.init(s)
+        def raw:buffer (enc.encodeNamed("Message" msg))
+        this.check("encoded" ((buffer_length raw) > 10))
+        def dec (new KiwiDecode())
+        dec.init(s)
+        def back:KiwiValue (dec.decodeNamed("Message" raw))
+        this.check("decoded" dec.ok)
+        def nc:KiwiValue (back.child("nodeChanges"))
+        this.check("nodeChanges is array" (nc.isArray()))
+        this.check("has nodes" ((nc.itemCount()) > 5))
+        def n0:KiwiValue (nc.item(0))
+        this.eqStr("root type" (n0.childString("type" "")) "DOCUMENT")
+    }
+
+    fn testStoredDeflate:void () {
+        print "--- stored deflate ---"
+        def src:buffer (buffer_alloc 5)
+        buffer_set src 0 65
+        buffer_set src 1 66
+        buffer_set src 2 67
+        buffer_set src 3 68
+        buffer_set src 4 69
+        def wrapped:buffer (FigDeflate.wrapStored(src))
+        def inf (new Inflate())
+        def out:buffer (inf.decompress(wrapped))
+        this.eqInt("len" (buffer_length out) 5)
+        this.eqInt("A" (buffer_get out 0) 65)
+        this.eqInt("E" (buffer_get out 4) 69)
+    }
+
+    fn testSampleFig:void () {
+        print "--- sample .fig ---"
+        def bytes:buffer (FigSample.buildFig())
+        this.check("zip bytes" ((buffer_length bytes) > 100))
+        def p (new FigParser())
+        def doc:FigDoc (p.parseBytes(bytes "sample.fig"))
+        this.check(("parse ok " + doc.err) doc.ok)
+        this.eqStr("prelude" doc.prelude "fig-kiwi")
+        this.eqInt("version" doc.version 101)
+        this.check("nodes" ((array_length doc.nodes) >= 10))
+        this.eqInt("pages" (array_length doc.pages) 3)
+        def p0:FigNode (doc.pageAt(0))
+        this.eqStr("page 0" p0.name "Welcome")
+        this.check("page has children" ((array_length p0.children) > 0))
+        this.eqStr("file name" doc.fileName "Ranger Fig sample")
+        this.check("no zstd on sample" (doc.usedZstd == false))
+    }
+
+    fn testViewer:void () {
+        print "--- viewer ---"
+        def app (new FigApp())
+        this.check("open sample" (app.openSample()))
+        this.eqInt("pages" (app.pageCount()) 3)
+        def scene:string (app.sceneJson())
+        this.check("scene has cmds" (FigTest.hasSub(scene "\"cmds\"")))
+        this.check("scene has text or fill" ((FigTest.hasSub(scene "text")) || (FigTest.hasSub(scene "\"c\":["))))
+        this.check("has draw cmds" (app.cmdCount > 0))
+        app.setPage(1)
+        this.eqInt("page 1" app.pageIndex 1)
+        def frames:string (app.framesJson())
+        this.check("frames json" (FigTest.hasSub(frames "Swatches")))
+    }
+
+    fn testSceneIr:void () {
+        print "--- scene IR ---"
+        def app (new FigApp())
+        this.check("open" (app.openSample()))
+        def a:string (app.sceneGraphJson())
+        def b:string (app.sceneGraphJson())
+        this.check("deterministic scene json" (a == b))
+        this.check("scene source figma" (FigTest.hasSub(a "\"source\":\"figma\"")))
+        this.check("has container" (FigTest.hasSub(a "\"type\":\"container\"")))
+        this.check("has rect" (FigTest.hasSub(a "\"type\":\"rect\"")))
+        def dump:string (app.evgText())
+        this.check("evg absolute" (FigTest.hasSub(dump "position=\"absolute\"")))
+        this.check("evg left" (FigTest.hasSub(dump "left=\"")))
+        this.check("evg width" (FigTest.hasSub(dump "width=\"")))
+        def d2:string (app.evgText())
+        this.check("deterministic evg dump" (dump == d2))
+        app.setPage(0)
+        def welcome:SceneNode (app.currentPage())
+        this.eqStr("welcome page" welcome.name "Welcome")
+        def card:SceneNode (welcome.childNamed("Card"))
+        this.eqStr("card kind" card.kind "container")
+        this.check("card clips" card.clip)
+        def hero:SceneNode (card.childNamed("Hero"))
+        this.eqStr("hero kind" hero.kind "rect")
+        this.check("hero has fill" ((array_length hero.fills) > 0))
+        ; An instance draws the component it names. This is the shape a
+        ; real export uses — no children of its own, a symbolID — and
+        ; without the lookup the node is an empty box.
+        app.setPage(2)
+        def shapes:SceneNode (app.currentPage())
+        def linked:SceneNode (shapes.childNamed("LinkedInstance"))
+        this.eqStr("linked instance is a container" linked.kind "container")
+        this.eqInt("linked instance drew the component" (array_length linked.children) 1)
+        if ((array_length linked.children) > 0) {
+            def borrowed:SceneNode (itemAt linked.children 0)
+            this.eqStr("and drew its child" borrowed.name "CompRect")
+        }
+        ; And the nested spelling a Figma export writes.
+        def nested:SceneNode (shapes.childNamed("NestedInstance"))
+        this.eqInt("nested symbolData resolved" (array_length nested.children) 1)
+        if ((array_length nested.children) > 0) {
+            def borrowed2:SceneNode (itemAt nested.children 0)
+            this.eqStr("nested drew the component's child" borrowed2.name "CompRect")
+        }
+        ; The change the designer made inside the instance. Reading the
+        ; component but not this is what leaves a whole file showing
+        ; placeholder text — the component's own "Title text" everywhere.
+        ; A path inside a turn is turned with it: the rotation is on the
+        ; box, the path carries none of its own, and the only way it lands
+        ; where the picture shows it is for the box's turn to reach it.
+        def turnedBox:SceneNode (shapes.childNamed("TurnedBox"))
+        this.check("the box is turned" turnedBox.hasXf)
+        this.eqInt("and holds the path" (array_length turnedBox.children) 1)
+
+        ; An image fill on something that is not a rectangle is still the
+        ; picture. A FigJam stamp is a container by type, and a container
+        ; with an image fill got the grey box that stands for a picture
+        ; nothing can draw — with the bytes read and in hand.
+        def photo:SceneNode (shapes.childNamed("PhotoFrame"))
+        this.eqStr("a container whose fill is a picture IS the picture" photo.kind "image")
+        this.eqStr("and it names the image" photo.imageRef "abc123")
+
+        ; A picture is not always shown whole. Figma keeps the crop window on
+        ; the PAINT — a matrix beside the bitmap, not the node's transform —
+        ; and a reader that drops it draws the whole frame where a detail
+        ; belongs. On a board where two boxes show two halves of one
+        ; screenshot, the two boxes are the same size and the same bytes and
+        ; differ only here, so dropping it drew the same picture twice.
+        def crop:SceneNode (shapes.childNamed("CroppedPhoto"))
+        this.eqStr("a cropped picture is still the picture" crop.kind "image")
+        if ((array_length crop.fills) > 0) {
+            def cf:SceneFill (crop.firstFill())
+            this.check("the crop is read off the paint" cf.imageCropped)
+            this.close("the window starts a quarter across" cf.cropX 0.25)
+            this.close("and halfway down" cf.cropY 0.5)
+            this.close("and is half the width" cf.cropW 0.5)
+            this.close("and a quarter of the height" cf.cropH 0.25)
+        }
+        def toEvg (new SceneToEVG())
+        def cropEl:EVGElement (toEvg.emit(crop))
+        this.check("and crosses to the element as a window" cropEl.imageViewBoxSet)
+        this.close("starting where the paint said" cropEl.imageViewBoxX 0.25)
+        this.close("and as wide as the paint said" cropEl.imageViewBoxW 0.5)
+
+        ; A nested instance carries entries for the same nodes as the one
+        ; outside it, saying what the component laid out rather than what
+        ; this instance of it did. Replacing the outer table with them drew
+        ; a resized instance at the component's own size — three stars that
+        ; belong in 112 pixels drawn across 240.
+        def nestedOv:SceneNode (shapes.childNamed("NestedOverride"))
+        if ((array_length nestedOv.children) > 0) {
+            def midInst:SceneNode (itemAt nestedOv.children 0)
+            if ((array_length midInst.children) > 0) {
+                def deepText:SceneNode (itemAt midInst.children 0)
+                this.eqStr("the deep override still replaces the text" deepText.text.characters "Deep real text")
+                this.close("and the outer instance's size survives the inner entry" deepText.w 90.0)
+                this.close("in both directions" deepText.h 12.0)
+            }
+        }
+        def titled:SceneNode (shapes.childNamed("TitledInstance"))
+        this.eqInt("the instance drew the component's text" (array_length titled.children) 1)
+        if ((array_length titled.children) > 0) {
+            def drawn:SceneNode (itemAt titled.children 0)
+            this.eqStr("and the override replaced the placeholder" drawn.text.characters "The real text")
+            this.check("and the overridden fill came with it" ((array_length drawn.fills) > 0))
+        }
+        ; The component itself keeps its own text: an override belongs to
+        ; the instance, not to what it was made from.
+        def master:SceneNode (shapes.childNamed("CardWithTitle"))
+        if ((array_length master.children) > 0) {
+            def masterText:SceneNode (itemAt master.children 0)
+            this.eqStr("the component keeps its placeholder" masterText.text.characters "Title text")
+        }
+
+        ; An override that reaches through a nested instance. Its path
+        ; names the nested instance and then the node inside it, so this
+        ; only works if the whole path is the key and the outer table
+        ; survives the descent.
+        def nested2:SceneNode (shapes.childNamed("NestedOverride"))
+        this.eqInt("the outer instance drew the wrapper" (array_length nested2.children) 1)
+        if ((array_length nested2.children) > 0) {
+            def innerInst:SceneNode (itemAt nested2.children 0)
+            this.eqInt("the nested instance drew its component" (array_length innerInst.children) 1)
+            if ((array_length innerInst.children) > 0) {
+                def deepText:SceneNode (itemAt innerInst.children 0)
+                this.eqStr("and the override reached two levels down" deepText.text.characters "Deep real text")
+            }
+        }
+        ; The same component drawn without that outer instance keeps its
+        ; own text: the override belongs to one instance, not to the file.
+        def plainWrapper:SceneNode (shapes.childNamed("WrapperCard"))
+        if ((array_length plainWrapper.children) > 0) {
+            def plainInner:SceneNode (itemAt plainWrapper.children 0)
+            if ((array_length plainInner.children) > 0) {
+                def plainText:SceneNode (itemAt plainInner.children 0)
+                this.eqStr("an untouched instance keeps the placeholder" plainText.text.characters "Inner placeholder")
+            }
+        }
+
+        ; An instance of a single-shape component borrows nothing and
+        ; loses nothing, so it is not reported.
+        def leafInst:SceneNode (shapes.childNamed("LeafInstance"))
+        this.eqInt("leaf instance has no borrowed children" (array_length leafInst.children) 0)
+        this.check("leaf instance still paints" ((array_length leafInst.fills) > 0))
+        def warns:string (app.warningsJson())
+        this.check("a leaf instance is not reported" ((FigTest.hasSub(warns "LeafInstance")) == false))
+        ; A stroke whose own outline came with the file is exact, whatever
+        ; its alignment says, so neither stroke warning applies to it.
+        this.check("an exact stroke is not reported" ((FigTest.hasSub(warns "ExactStroke")) == false))
+        this.check("a guessed stroke is reported" (FigTest.hasSub(warns "GuessedStroke")))
+        ; The two reports that answer "nothing is warned about and it still
+        ; looks wrong". The census has to name the types actually in the
+        ; scene, and the unread list has to leave out fields the converter
+        ; does read — a list that includes them is noise nobody can use.
+        def census:string (app.censusJson())
+        this.check("census names a type in the scene" (FigTest.hasSub(census "\"type\":\"FRAME\"")))
+        this.check("census counts what draws nothing" (FigTest.hasSub(census "drawNothing")))
+        this.check("census counts missing images" (FigTest.hasSub(census "imagesMissing")))
+        ; FigJam: a sticky has no children and its look is in two derived
+        ; lists. Reading neither leaves an empty box, which is what a whole
+        ; board came out as.
+        def sticky:SceneNode (shapes.childNamed("Sticky"))
+        this.eqStr("sticky is a container" sticky.kind "container")
+        this.eqInt("sticky drew its layers, and not the hidden one" (array_length sticky.children) 2)
+        if ((array_length sticky.children) > 1) {
+            def body:SceneNode (itemAt sticky.children 0)
+            this.eqStr("the sticky body is its geometry" body.kind "path")
+            this.check("and it is painted" ((array_length body.fills) > 0))
+            def note:SceneNode (itemAt sticky.children 1)
+            this.eqStr("the sticky text is text" note.kind "text")
+            this.eqStr("and it says what the file says" note.text.characters "Sticky text")
+            this.close("the text layer sits where the frame put it" note.x 20.0)
+            this.close("and at its own offset down" note.y 20.0)
+        }
+        ; The first guid names the layer and the rest name the cell, so a
+        ; cell's text is placed against the background with the same path
+        ; TAIL. Matched on the prefix instead, every cell's text lands in
+        ; the first cell.
+        def table:SceneNode (shapes.childNamed("Table"))
+        this.eqInt("the table drew a layer per cell" (array_length table.children) 5)
+        if ((array_length table.children) > 2) {
+            def cellText:SceneNode (itemAt table.children 2)
+            this.eqStr("the cell text is text" cellText.text.characters "Cell two")
+            this.close("and it is in the second cell" cellText.x 110.0)
+            this.close("at the cell's own inset" cellText.y 10.0)
+        }
+        ; What every cell has in common is not repeated on each of them: a
+        ; table ships a block for the cell and one for the cell's text,
+        ; keyed by a layer guid with no geometry, and a per-cell entry says
+        ; only what differs. Read the per-cell entries alone and a table is
+        ; a slab with no grid and nothing written in it.
+        if ((array_length table.children) > 4) {
+            def plain:SceneNode (itemAt table.children 3)
+            def plainFill:SceneFill (plain.firstFill())
+            this.eqStr("a cell with no style of its own is the default cell" (plainFill.hex()) "#ffffff")
+            this.check("with the rule that draws the grid" ((array_length plain.strokes) > 0))
+            def plainText:SceneNode (itemAt table.children 4)
+            this.eqStr("and its text is text, not a box" plainText.kind "text")
+            def plainInk:SceneFill (plainText.firstFill())
+            this.eqStr("in the ink the default gives it" (plainInk.hex()) "#1a1a1a")
+            this.close("and that size" plainText.text.fontSize 14.0)
+        }
+        ; A connector ships three layers and the file styles one of them:
+        ; the line. The other two are its label — the text and the rounded
+        ; box behind it — and with no label there is nothing to paint them
+        ; with. Handed the line's block anyway, that box was filled, which
+        ; put a coloured square on the end of a divider drawn this way.
+        def conn:SceneNode (shapes.childNamed("Connector line"))
+        this.eqInt("the connector drew its layers" (array_length conn.children) 3)
+        if ((array_length conn.children) > 2) {
+            def line:SceneNode (itemAt conn.children 0)
+            this.eqInt("the line is its stroke outline" (array_length line.children) 1)
+            if ((array_length line.children) > 0) {
+                def ink:SceneNode (itemAt line.children 0)
+                this.check("painted in the colour the file gives the line" ((array_length ink.fills) > 0))
+            }
+            def chip:SceneNode (itemAt conn.children 2)
+            this.check("the empty label box is not filled" ((array_length chip.fills) == 0))
+            this.check("and not stroked either" ((array_length chip.strokes) == 0))
+        }
+        ; A frame paints its stroke over its content; a section does not.
+        ; What is on a board is drawn over the section's edge, so a sticker
+        ; left across a corner is whole — with the stroke last it was cut
+        ; by a green line at the section's boundary.
+        def sect:SceneNode (shapes.childNamed("Board section"))
+        this.eqInt("the section drew its stroke and its sticker" (array_length sect.children) 2)
+        if ((array_length sect.children) > 1) {
+            def edge:SceneNode (itemAt sect.children 0)
+            this.eqStr("the stroke is under what sits on the section" edge.sourceType "STROKE_GEOMETRY")
+            def sticker:SceneNode (itemAt sect.children 1)
+            this.eqStr("and the sticker over it" sticker.name "Sticker")
+        }
+        ; An underline is per-character styling: which characters carry it
+        ; is in the text's style table, and where the line goes is the
+        ; font's business, so Figma works it out and the file carries the
+        ; rectangle. Read the glyphs and not that, and the line is missing.
+        def under:SceneNode (shapes.childNamed("Underlined"))
+        this.check("the text kept the glyphs it was shaped into" (under.text.hasOutline()))
+        this.check("and carries the underline the file computed" (FigTest.hasSub(under.text.outline "M10 30L130 30L130 33L10 33Z")))
+        ; An emoji's slot in the glyph list is the em square its picture
+        ; goes in, not an outline of it. Filled in the text's ink — which
+        ; is what drawing every glyph does — it is a black block, and a
+        ; table heading came out as "Status ■". It is left out and the code
+        ; point is drawn as text, in whatever emoji font the machine has,
+        ; because the picture Figma drew is not in the file.
+        this.eqInt("the emoji is not filled as a glyph" (array_length under.children) 1)
+        if ((array_length under.children) > 0) {
+            def emo:SceneNode (itemAt under.children 0)
+            this.eqStr("it is drawn as the character it is" emo.sourceType "EMOJI")
+            def wanted:string (EVGCodepoint.toStr(128677))
+            this.eqStr("with the code point the file names" emo.text.characters wanted)
+            this.close("at the x the file gives it" emo.x 40.0)
+            this.close("in the em square above the baseline" emo.y 1.6800000000000015)
+            this.close("as wide as its advance" emo.w 24.0)
+        }
+        ; A stroke the file brought as geometry is painted by a child, and
+        ; the layer keeps saying what its edge is — so the pane can show it
+        ; and an edit reaches the thing that draws. Recolouring used to
+        ; move the number and leave the page as it was.
+        def exact:SceneNode (shapes.childNamed("ExactStroke"))
+        this.check("the layer still says what its edge is" ((array_length exact.strokes) > 0))
+        this.check("and that the outline paints it" exact.strokeIsGeometry)
+        app.select("3:44")
+        app.editStroke("#ff00ff" (0.0 - 1.0))
+        def outline:SceneNode (exact.childNamed("stroke"))
+        def ink:SceneFill (outline.firstFill())
+        this.eqStr("recolouring reaches the outline that draws" (ink.hex()) "#ff00ff")
+        ; A new weight cannot: the outline IS the old weight, drawn. It is
+        ; dropped and the border takes over at the weight asked for.
+        app.editStroke("#ff00ff" 9.0)
+        def gone:SceneNode (exact.childNamed("stroke"))
+        this.eqInt("a new weight drops the outline it cannot re-flatten" (strlen gone.id) 0)
+        this.check("and the layer draws its own border again" (exact.strokeIsGeometry == false))
+        app.revertEdits()
+
+        ; The selection report: what the file gave ONE layer, what the
+        ; reader made of it, and which of the two is missing the colour. A
+        ; page that draws wrong in a file nobody can send anywhere is
+        ; otherwise only describable in gestures.
+        def why:string (app.layerDebug("3:82"))
+        this.check("the report says where the layer sits" (FigTest.hasSub(why "StyledFill")))
+        this.check("and that it draws nothing" (FigTest.hasSub(why "NOTHING")))
+        this.check("and names the style its colour is left to" (FigTest.hasSub(why "named style 9:99")))
+        this.check("and that the file does not carry it" (FigTest.hasSub(why "NOT IN FILE")))
+        this.check("and that the colour is therefore nowhere" (FigTest.hasSub(why "nothing can recover")))
+        def whyText:string (app.layerDebug("3:60#40000000:1"))
+        this.check("a layer Figma built is reported as one" (FigTest.hasSub(whyText "Figma built")))
+        this.check("and the report reads it as text" (FigTest.hasSub(whyText "Sticky text")))
+
+        ; Picking a layer. The point is moved into each layer's own space
+        ; on the way down, so a turned layer answers where it is DRAWN:
+        ; Tilt is 80x48 at 50,50 inside a frame at 40,600, turned 15
+        ; degrees about its own origin, and the part of it the turn puts at
+        ; 146,710 is well outside the square box the test used to be made
+        ; against — while 165,655 is inside that box and outside the layer.
+        app.setView(0.0 0.0 1.0)
+        this.eqStr("a turned layer is picked where it is drawn" (app.hit(146.0 710.0)) "3:31")
+        this.eqStr("and not where its square box was" (app.hit(165.0 655.0)) "3:13")
+        ; The rule that fills a ring and not its hole. A fig file spells it
+        ; "ODD" and the reader tested for the CSS spelling, so it NEVER
+        ; matched: every even-odd path was filled non-zero and an outline
+        ; swallowed its own middle — a hand icon came out as a black blob,
+        ; and this board has 171 paths that ask for the rule.
+        def ring:SceneNode (shapes.childNamed("RingPath"))
+        this.check("the file's own spelling of even-odd is read" ring.evenOdd)
+
+        ; A mirrored layer answers where it is DRAWN too. MirrorBox is 80x40
+        ; at 2900,1860 with a horizontal flip, so the file puts it to the
+        ; LEFT of that origin — read as the half turn its angle looks like,
+        ; it would sit above it instead, which is how an icon "turned 180
+        ; degrees" ended up forty pixels up the page.
+        this.eqStr("a mirrored layer is picked where it is drawn" (app.hit(2860.0 1880.0)) "3:87")
+        this.eqStr("and not where a half turn would have put it" (app.hit(2860.0 1840.0)) "")
+        ; And a layer is picked whether or not its parent's box holds the
+        ; point: the sticker hangs 40 pixels above the section it is in,
+        ; and gating the walk on the parent left that half unselectable.
+        this.eqStr("a layer outside its parent is still picked" (app.hit(2980.0 1240.0)) "3:79")
+        ; The deepest thing that puts ink on the canvas wins, so a click on
+        ; a cell's text is the text and not the box it sits in.
+        this.eqStr("the deepest drawn layer wins" (app.hit(3000.0 818.0)) "3:61#40000000:1/9:2")
+        ; A component out of a library keeps its identity in overrideKey,
+        ; and the override path names that and not the guid the copy was
+        ; given. The text is in what the designer typed; the size is in
+        ; what Figma computed — both lists have to be read.
+        def keyed:SceneNode (shapes.childNamed("KeyedInstance"))
+        this.eqInt("the keyed instance drew the component" (array_length keyed.children) 1)
+        if ((array_length keyed.children) > 0) {
+            def keyedText:SceneNode (itemAt keyed.children 0)
+            this.eqStr("an overrideKey path places the edit" keyedText.text.characters "Typed by hand")
+            this.close("and the derived entry brought its size" keyedText.h 44.0)
+        }
+        def keyedMaster:SceneNode (shapes.childNamed("KeyedCard"))
+        if ((array_length keyedMaster.children) > 0) {
+            def keyedPlaceholder:SceneNode (itemAt keyedMaster.children 0)
+            this.eqStr("the component keeps its placeholder" keyedPlaceholder.text.characters "Keyed placeholder")
+        }
+        ; An instance swapped for another component draws the one it was
+        ; swapped to. Read after the name instead of over it, the swap
+        ; never won and a card drew the variant the set lists first.
+        def swapped:SceneNode (shapes.childNamed("SwappedInstance"))
+        this.eqInt("the swapped instance drew a component" (array_length swapped.children) 1)
+        if ((array_length swapped.children) > 0) {
+            def swappedText:SceneNode (itemAt swapped.children 0)
+            this.eqStr("and it is the one it was swapped to" swappedText.text.characters "You are here")
+        }
+        def unread:string (app.unreadJson())
+        this.check("unread leaves out fillPaints" ((FigTest.hasSub(unread "\"field\":\"fillPaints\"")) == false))
+        this.check("unread leaves out transform" ((FigTest.hasSub(unread "\"field\":\"transform\"")) == false))
+        this.check("unread leaves out symbolData" ((FigTest.hasSub(unread "\"field\":\"symbolData\"")) == false))
+    }
+
+    ; The right-hand pane, and the ring on the canvas. Both read the same
+    ; box, and the box has to be walked to: a node's x/y is an offset from
+    ; its parent, so a title twenty pixels into a card is not at 20,20 on
+    ; the page.
+    fn testInspector:void () {
+        print "--- inspector ---"
+        def app (new FigApp())
+        this.check("open" (app.openSample()))
+        app.setPage(2)
+        app.select("3:47")
+        def sel:string (app.inspectJson())
+        this.check("the pane names the layer" (FigTest.hasSub(sel "\"id\":\"3:47\"")))
+        this.check("its own offset is from its parent" (FigTest.hasSub(sel "\"x\":20")))
+        ; CardWithTitle sits at 1380,800 and the title 20,20 inside it.
+        this.check("and its place on the page is walked to" (FigTest.hasSub(sel "\"pageX\":1400")))
+        this.check("in both axes" (FigTest.hasSub(sel "\"pageY\":820")))
+        this.check("the text comes with it" (FigTest.hasSub(sel "\"chars\":\"Title text\"")))
+        ; An edit is a value on the scene graph and a repaint, nothing more.
+        app.editOpacity(0.5)
+        app.editFill("#ff0000")
+        app.editText("Retyped")
+        def edited:string (app.inspectJson())
+        this.check("an edit changes the layer" (FigTest.hasSub(edited "\"opacity\":0.5")))
+        this.check("a colour is a colour" (FigTest.hasSub(edited "\"hex\":\"#ff0000\"")))
+        this.check("retyping replaces the text" (FigTest.hasSub(edited "\"chars\":\"Retyped\"")))
+        this.check("and drops the outlines it was shaped into" (FigTest.hasSub(edited "\"outline\":false")))
+        this.eqInt("the edits are counted" (app.editCount()) 3)
+        app.revertEdits()
+        app.setPage(2)
+        app.select("3:47")
+        def back:string (app.inspectJson())
+        this.check("revert reads the layer back from the file" (FigTest.hasSub(back "\"chars\":\"Title text\"")))
+        this.check("with its own colour" ((FigTest.hasSub(back "\"hex\":\"#ff0000\"")) == false))
+        this.eqInt("and no edits left" (app.editCount()) 0)
+        ; THE PANEL IS ABOUT WHAT IS SELECTED, so the pane carries the
+        ; things that decide that: the turn that places the layer, the box it
+        ; is placed inside, and the component an instance came from. Each was
+        ; missing, and each is a control the panel could not offer without it.
+        app.select("3:47")
+        def rich:string (app.inspectJson())
+        this.check("the turn is on the pane" (FigTest.hasSub(rich "\"rotation\":")))
+        this.check("and whether the layer is mirrored" (FigTest.hasSub(rich "\"mirrored\":")))
+        this.check("the parent's box, which is what aligning needs" (FigTest.hasSub(rich "\"parentW\":")))
+        this.check("and its name, to say where the layer sits" (FigTest.hasSub(rich "\"parentName\":")))
+
+        ; A TURN AND A MIRROR ARE DIFFERENT THINGS. No angle reverses
+        ; handedness, so flipping is its own switch — and a layer given an
+        ; angle after being flipped stays flipped.
+        ; Read back within half a degree, not exactly: the angle comes back
+        ; through `rotationDeg`, which is an approximation good to a third of
+        ; one (see `testRotationAngle`). Half a degree catches an axis swapped
+        ; or a sign lost and lets the arithmetic be what it is.
+        app.editRotation(30.0)
+        def turned:SceneNode (app.findScene("3:47"))
+        this.check("a layer takes the angle it is given" ((fabs ((turned.xf.rotationDeg()) - 30.0)) < 0.5))
+        app.editFlip()
+        def flipped:SceneNode (app.findScene("3:47"))
+        this.check("and a flip is a mirror, not a half turn" (flipped.xf.isMirrored()))
+        this.check("which leaves the angle where it was" ((fabs ((flipped.xf.rotationDeg()) - 30.0)) < 0.5))
+        app.editRotation((0.0 - 45.0))
+        def again:SceneNode (app.findScene("3:47"))
+        this.check("turning a mirrored layer keeps the mirror" (again.xf.isMirrored()))
+        this.check("at the new angle" ((fabs ((again.xf.rotationDeg()) + 45.0)) < 0.5))
+
+        ; A HAND TURNS A THING ABOUT ITS MIDDLE. The file's matrix turns a
+        ; layer about its own ORIGIN, so about the corner a half turn sends
+        ; a layer its own height up the page and its own width to the left —
+        ; which is the layer leaving the place it was being turned in. The
+        ; middle is held and the origin moved to wherever the angle puts it.
+        app.editRotation(0.0)
+        def flat:SceneNode (app.findScene("3:47"))
+        def midX:double (flat.x + ((FigApp.linX(flat.xf (flat.w * 0.5) (flat.h * 0.5)))))
+        def midY:double (flat.y + ((FigApp.linY(flat.xf (flat.w * 0.5) (flat.h * 0.5)))))
+        app.editRotation(90.0)
+        def turned90:SceneNode (app.findScene("3:47"))
+        def m2x:double (turned90.x + ((FigApp.linX(turned90.xf (turned90.w * 0.5) (turned90.h * 0.5)))))
+        def m2y:double (turned90.y + ((FigApp.linY(turned90.xf (turned90.w * 0.5) (turned90.h * 0.5)))))
+        this.close("a quarter turn leaves the middle where it was" m2x midX)
+        this.close("in both axes" m2y midY)
+        app.editFlip()
+        def flip2:SceneNode (app.findScene("3:47"))
+        def m3x:double (flip2.x + ((FigApp.linX(flip2.xf (flip2.w * 0.5) (flip2.h * 0.5)))))
+        this.close("and so does a flip" m3x midX)
+
+        ; AND THE RING GOES ROUND WHAT IS DRAWN, mirror or no mirror. A
+        ; mirrored matrix is M = R(theta) diag(1, -1): read as a plain turn
+        ; about the origin it names, the ring comes out BESIDE the layer —
+        ; a whole height away and touching it, which is exactly what the
+        ; arrow inside a mirrored instance drew. The flip sends the box's
+        ; [0, h] to [-h, 0] before the turn, so the rectangle that is turned
+        ; starts one height higher up.
+        ;
+        ; The check is the one thing a ring has to satisfy and the one thing
+        ; the old code failed: the four corners it is drawn at span the same
+        ; rectangle the layer's own corners do.
+        ; A flip is a TOGGLE and this layer has been flipped once already.
+        def pre:SceneNode (app.findScene("3:47"))
+        if ((pre.xf.isMirrored()) == false) {
+            app.editFlip()
+        }
+        ; The list is in PAGE pixels with the view baked in and the box is in
+        ; scene units, so the view is put back to nothing for the comparison.
+        app.setCamera(false)
+        app.setView(0.0 0.0 1.0)
+        app.setRing(true)
+        def mbox:SceneNode (app.absBox("3:47"))
+        this.check("the mirrored layer is mirrored on the page" (mbox.xf.isMirrored()))
+        def ri:int (FigTest.lastFrameIndex(app.list))
+        this.check("and it has a ring" (ri >= 0))
+        if (ri >= 0) {
+            def rc:EVGDrawCmd (itemAt app.list.cmds ri)
+            def rad:double ((rc.rotate * 3.141592653589793) / 180.0)
+            def co:double (cos rad)
+            def si:double (sin rad)
+            def lo:double 0.0
+            def hi:double 0.0
+            def lo2:double 0.0
+            def hi2:double 0.0
+            def ci:int 0
+            while (ci < 4) {
+                def px:double rc.x
+                def py:double rc.y
+                if ((ci == 1) || (ci == 2)) {
+                    px = (rc.x + rc.w)
+                }
+                if ((ci == 2) || (ci == 3)) {
+                    py = (rc.y + rc.h)
+                }
+                def dx:double (px - rc.rotOriginX)
+                def dy:double (py - rc.rotOriginY)
+                def wx:double (rc.rotOriginX + ((dx * co) - (dy * si)))
+                def wy:double (rc.rotOriginY + ((dx * si) + (dy * co)))
+                if (ci == 0) {
+                    lo = wx
+                    hi = wx
+                    lo2 = wy
+                    hi2 = wy
+                }
+                if (wx < lo) { lo = wx }
+                if (wx > hi) { hi = wx }
+                if (wy < lo2) { lo2 = wy }
+                if (wy > hi2) { hi2 = wy }
+                ci = (ci + 1)
+            }
+            this.close("the ring starts where the layer does" lo mbox.x)
+            this.close("in both axes" lo2 mbox.y)
+            this.close("and is as wide as the layer is" (hi - lo) mbox.w)
+            this.close("and as tall" (hi2 - lo2) mbox.h)
+        }
+        app.setRing(false)
+
+        ; AND WHAT IS INSIDE GOES WITH THE BOX. A layer's box is not a frame
+        ; drawn around its content — it IS the content's extent, and a sticky
+        ; made wider while its body stayed the old width came out as a ring
+        ; with a white wedge inside it.
+        app.editRotation(0.0)
+        def host:SceneNode (app.findScene("3:47"))
+        def kidW:double 0.0
+        if ((array_length host.children) > 0) {
+            def kid0:SceneNode (itemAt host.children 0)
+            kidW = kid0.w
+        }
+        def hostW:double host.w
+        app.editRect(host.x host.y (hostW * 2.0) host.h)
+        def grown:SceneNode (app.findScene("3:47"))
+        if ((array_length grown.children) > 0) {
+            def kid1:SceneNode (itemAt grown.children 0)
+            this.close("the subtree grows with the box" kid1.w (kidW * 2.0))
+        }
+
+        ; A PAINT'S OWN STRENGTH, which is not the layer's. Figma writes the
+        ; two separately — a frame at full opacity filled #ff8f82 at 15% — and
+        ; the pane carried one folded #rrggbbaa, so the 15% was somewhere no
+        ; control could reach it and `Opacity` moved the layer and everything
+        ; inside it instead.
+        app.select("3:47")
+        app.editFill("#ff8f82")
+        def pane:string (app.inspectJson())
+        this.check("every paint is on the pane, not just the first" (FigTest.hasSub(pane "\"fills\":[")))
+        this.check("with its own strength" (FigTest.hasSub(pane "\"opacity\":")))
+        app.editFillOpacity(0 0.15)
+        def faded:SceneNode (app.findScene("3:47"))
+        def p0:SceneFill (itemAt faded.fills 0)
+        this.close("a paint takes the strength it is given" (p0.a * p0.opacity) 0.15)
+        this.close("and the layer's own opacity is untouched" faded.opacity 1.0)
+        this.check("which the colour carries as alpha" (FigTest.hasSub((p0.hexA()) "26")))
+        app.editFillVisible(0 false)
+        def hidden:SceneNode (app.findScene("3:47"))
+        def p1:SceneFill (itemAt hidden.fills 0)
+        this.check("a paint can be turned off on its own" (p1.visible == false))
+        app.editFillVisible(0 true)
+        app.editFillAt(0 "#112233")
+        def recol:SceneNode (app.findScene("3:47"))
+        def p2:SceneFill (itemAt recol.fills 0)
+        this.eqStr("and recoloured by index" (p2.hex()) "#112233")
+        this.close("without losing the strength" (p2.a * p2.opacity) 0.15)
+        ; A paint that is not there is not written, and does not throw.
+        app.editFillOpacity(9 0.5)
+        app.editFillAt((0 - 1) "#000000")
+        def same:SceneNode (app.findScene("3:47"))
+        this.eqInt("an index past the end writes nothing" (array_length same.fills) 1)
+        app.editFillOpacity(0 1.0)
+
+        ; The text's own numbers, which could be seen and not tried.
+        app.editTextStyle(28.0 1.2 0.0 "center")
+        def styled:string (app.inspectJson())
+        this.check("a text layer takes a size" (FigTest.hasSub(styled "\"size\":28")))
+        this.check("and an alignment" (FigTest.hasSub(styled "\"align\":\"center\"")))
+        app.editClip(true)
+        this.check("a container can be told to cut its children off" (FigTest.hasSub((app.inspectJson()) "\"clip\":true")))
+
+        ; AN ID OF ITS OWN FOR EVERY COPY. A component's layers are drawn
+        ; under every instance of it, and each copy used to carry the
+        ; COMPONENT's id — so an arrow used three times was three layers all
+        ; called `2:143`. Everything that looks a layer up walks the page and
+        ; takes the FIRST match, so clicking the third arrow selected the
+        ; first: the ring, the panel's numbers and the handles all described
+        ; a layer somewhere else on the board. The outer layers were right
+        ; because a top-level node appears once — the page was right and its
+        ; insides were not.
+        def seen:[string:int]
+        def dups:int 0
+        def count:int 0
+        def pgs:[SceneNode] app.sceneDoc.pages
+        def pi:int 0
+        while (pi < (array_length pgs)) {
+            dups = (dups + (FigTest.countDupIds((itemAt pgs pi) seen)))
+            pi = (pi + 1)
+        }
+        this.eqInt("no layer on the page shares an id with another" dups 0)
+
+        ; THE BOXES A DRAG CAN LINE UP WITH. A hand puts a layer where it
+        ; looks right, and what "right" means is the edges of what is beside
+        ; it — so the host is handed the siblings and the parent, in page
+        ; coordinates, and nothing further: a guide to a layer on the other
+        ; side of a board is a guide to nothing.
+        def snaps:string (app.snapBoxesJson())
+        this.check("the drag is given boxes to line up with" (FigTest.hasSub(snaps "\"x\":")))
+        this.check("with their sizes, so centres and far edges count too" (FigTest.hasSub(snaps "\"w\":")))
+        app.select("")
+        this.eqStr("and nothing selected lines up with nothing" (app.snapBoxesJson()) "[]")
+        app.select("3:47")
+        app.revertEdits()
+
+        ; A layer nobody selected has no pane.
+        app.select("")
+        this.eqStr("nothing selected, nothing shown" (app.inspectJson()) "{}")
+    }
+
+    fn testFixtures:void () {
+        print "--- fixtures ---"
+        def app (new FigApp())
+        this.check("open" (app.openSample()))
+        app.setPage(2)
+        def fixtures:SceneNode (app.currentPage())
+        this.eqStr("fixtures page" fixtures.name "Fixtures")
+        def frames:string (app.framesJson())
+        this.check("01-basic-rect" (FigTest.hasSub(frames "01-basic-rect")))
+        this.check("02-border-radius" (FigTest.hasSub(frames "02-border-radius")))
+        this.check("03-stroke" (FigTest.hasSub(frames "03-stroke")))
+        this.check("04-opacity" (FigTest.hasSub(frames "04-opacity")))
+        this.check("05-clipping" (FigTest.hasSub(frames "05-clipping")))
+        this.check("06-text" (FigTest.hasSub(frames "06-text")))
+        this.check("07-multiline-text" (FigTest.hasSub(frames "07-multiline-text")))
+        this.check("08-image" (FigTest.hasSub(frames "08-image")))
+        this.check("09-vector" (FigTest.hasSub(frames "09-vector")))
+        this.check("10-auto-layout-horizontal" (FigTest.hasSub(frames "10-auto-layout-horizontal")))
+        this.check("11-auto-layout-vertical" (FigTest.hasSub(frames "11-auto-layout-vertical")))
+        this.check("12-nested-frame" (FigTest.hasSub(frames "12-nested-frame")))
+        this.check("13-rotation" (FigTest.hasSub(frames "13-rotation")))
+        this.check("14-shadow" (FigTest.hasSub(frames "14-shadow")))
+        this.check("15-gradient" (FigTest.hasSub(frames "15-gradient")))
+        def page:SceneNode (app.currentPage())
+        def basic:SceneNode (page.childNamed("01-basic-rect"))
+        def rect:SceneNode (basic.childNamed("Rect"))
+        this.eqStr("basic rect kind" rect.kind "rect")
+        this.close("basic rect x" rect.x 20.0)
+        this.close("basic rect y" rect.y 20.0)
+        def clip:SceneNode (page.childNamed("05-clipping"))
+        this.check("clip frame" clip.clip)
+        def textFrame:SceneNode (page.childNamed("06-text"))
+        def txt:SceneNode (textFrame.childNamed("Hello"))
+        this.eqStr("text kind" txt.kind "text")
+        this.eqStr("text chars" txt.text.characters "Hello")
+        def vecFrame:SceneNode (page.childNamed("09-vector"))
+        def vec:SceneNode (vecFrame.childNamed("Triangle"))
+        this.eqStr("vector kind" vec.kind "path")
+        this.check("vector path" ((strlen vec.pathData) > 0))
+        def row:SceneNode (page.childNamed("10-auto-layout-horizontal"))
+        this.eqStr("row layout" row.layout.mode "row")
+        def col:SceneNode (page.childNamed("11-auto-layout-vertical"))
+        this.eqStr("col layout" col.layout.mode "column")
+        def rotFrame:SceneNode (page.childNamed("13-rotation"))
+        def tilt:SceneNode (rotFrame.childNamed("Tilt"))
+        this.check("tilt has transform" tilt.hasXf)
+        def gradFrame:SceneNode (page.childNamed("15-gradient"))
+        def fade:SceneNode (gradFrame.childNamed("Fade"))
+        def fadeFill:SceneFill (fade.firstFill())
+        this.eqStr("gradient fill" fadeFill.kind "gradient")
+        ; A display list carries two stops, so a gradient authored with
+        ; more keeps its ENDS — taking the first two instead ended a
+        ; red-amber-green scale at amber. And each end keeps its own
+        ; alpha: a track at 16% red over white is a tint, and dropped it
+        ; came out in poster red.
+        def tint:SceneNode (gradFrame.childNamed("Tint"))
+        def tintFill:SceneFill (tint.firstFill())
+        this.eqStr("the tint is a gradient" tintFill.kind "gradient")
+        this.close("it starts at the first stop" tintFill.r 0.949)
+        this.close("and ends at the last, not the second" tintFill.gradG 0.663)
+        this.close("the near end keeps its alpha" tintFill.a 0.16)
+        this.close("and the far end its own" tintFill.gradA 0.16)
+        ; The same ramp on a vector keeps BOTH now. A gradient used to cross
+        ; the list as a BOX, so a vector had to choose: painted as a box it
+        ; drew a grey square where a rounded pill should be, and flattened
+        ; to one colour it kept the pill and lost the shading. The command
+        ; carries the rings and the two stops together, so neither is given
+        ; up and nothing is left to report.
+        def gvec:SceneNode (gradFrame.childNamed("GradientVector"))
+        this.eqStr("a vector with a gradient is still a path" gvec.kind "path")
+        def gvConv (new SceneToEVG())
+        def gvEl:EVGElement (gvConv.emit(gvec))
+        this.check("and it carries both stops" gvEl.gradientSet)
+        def gvJson:string (app.sceneJson())
+        this.check("which reach the painter on a PATH command" (FigTest.hasSub(gvJson "\"k\":6")))
+        this.check("no longer reported as lost" ((FigTest.hasSub((app.warningsJson()) "gradient on a vector")) == false))
+        def tintHex:string (tintFill.hexA())
+        def tintFar:string (tintFill.gradHexA())
+        this.check("so the colour carries it" (FigTest.hasSub(tintHex "29")))
+        this.check("at both ends" (FigTest.hasSub(tintFar "29")))
+        app.setFrame(0)
+        def dump:string (app.evgText())
+        this.check("fixture evg abs" (FigTest.hasSub(dump "position=\"absolute\"")))
+        this.check("fixture evg left" (FigTest.hasSub(dump "left=\"")))
+    }
+
+    ; gallery/figma/fixtures/health.fig — a real Figma export. Three phone
+    ; frames built with Auto Layout, text in Space Grotesk and Inter,
+    ; one image, stroke-only vectors, a background blur on the tab bars.
+    fn testHealthFig:void () {
+        print "--- health.fig ---"
+        def bytes:buffer (buffer_read_file "gallery/figma/fixtures" "health.fig")
+        this.check("fixture bytes" ((buffer_length bytes) > 1000))
+        def app (new FigApp())
+        this.check("open" (app.openBytes(bytes "health.fig")))
+        this.eqInt("pages" (app.pageCount()) 1)
+        def frames:string (app.framesJson())
+        this.check("Dashboard" (FigTest.hasSub(frames "Dashboard")))
+        this.check("Activity" (FigTest.hasSub(frames "Activity")))
+        this.check("Progress" (FigTest.hasSub(frames "Progress")))
+        def page:SceneNode (app.currentPage())
+        def paper:SceneFill (page.firstFill())
+        this.eqStr("canvas background" (paper.hex()) "#f5f5f5")
+        def dash:SceneNode (page.childNamed("Dashboard"))
+        def container:SceneNode (dash.childNamed("Container"))
+        this.eqStr("column layout" container.layout.mode "column")
+        this.close("gap" container.layout.gap 28.0)
+        this.close("padding left" container.layout.padL 20.0)
+        this.close("padding top" container.layout.padT 28.0)
+        this.close("padding right" container.layout.padR 20.0)
+        this.close("padding bottom" container.layout.padB 112.0)
+        this.check("hugs height" container.layout.hugH)
+        def header:SceneNode (container.childNamed("Header"))
+        this.eqStr("row layout" header.layout.mode "row")
+        this.eqStr("space between" header.layout.justify "space-between")
+        this.close("header x" header.x 20.0)
+        this.close("header y" header.y 28.0)
+        def nav:SceneNode (container.childNamed("Navigation"))
+        this.check("nav is absolute in the stack" nav.layout.absolute)
+        this.close("nav backdrop blur" (nav.backdropBlur()) 8.0)
+        def title:SceneNode (app.findScene("1:9"))
+        this.eqStr("title text" title.text.characters "YOUR HEALTH")
+        this.eqStr("title family" title.text.fontFamily "Space Grotesk")
+        this.eqStr("title weight" title.text.fontWeight "700")
+        this.close("title size" title.text.fontSize 30.0)
+        this.close("title line height" title.text.lineHeight 1.2)
+        this.close("title letter spacing" title.text.letterSpacing (0.0 - 0.75))
+        this.check("title has outlines" (title.text.hasOutline()))
+        this.check("outline uses curves" (FigTest.hasSub(title.text.outline "Q")))
+        def avatar:SceneNode (app.findScene("1:13"))
+        this.eqStr("avatar kind" avatar.kind "image")
+        this.eqStr("avatar ref" avatar.imageRef "aa64b7b3e303e0ea28a3bb6efa93741511acd803")
+        def line:SceneNode (app.findScene("1:119"))
+        this.eqStr("chart line kind" line.kind "path")
+        ; The outline paints the stroke, and the stroke stays on the layer:
+        ; it is what the layer says about its own edge, and a pane that
+        ; cannot read it can neither show it nor change it.
+        this.check("chart line keeps what it says about its edge" ((array_length line.strokes) > 0))
+        this.check("and knows the outline paints it" line.strokeIsGeometry)
+        def lineStroke:SceneNode (line.childNamed("stroke"))
+        this.eqStr("stroke geometry" lineStroke.sourceType "STROKE_GEOMETRY")
+        this.check("stroke geometry path" ((strlen lineStroke.pathData) > 0))
+        ; And the renderer is not told to draw one as well: nothing in this
+        ; file's page carries a stroke or a border, every one of them
+        ; having come as geometry.
+        def lineEvg:string (app.evgText())
+        this.check("and no stroke is drawn on top of the outlines" ((FigTest.hasSub(lineEvg "stroke=")) == false))
+        this.check("nor a border" ((FigTest.hasSub(lineEvg "border-width=")) == false))
+        def track:SceneNode (app.findScene("1:35"))
+        def trackFill:SceneFill (track.firstFill())
+        this.eqStr("translucent fill in the colour" (trackFill.hexA()) "#00000026")
+        this.close("node opacity untouched" track.opacity 1.0)
+        def dump:string (app.evgText())
+        this.check("header placed at 20,28" (FigTest.hasSub(dump "id=\"1:4\" position=\"absolute\" left=\"20px\" top=\"28px\"")))
+        this.check("viewport painted in the canvas colour" (FigTest.hasSub(dump "background=\"#F5F5F5\"")))
+        this.check("no text spans" ((FigTest.hasSub(dump "<span")) == false))
+        this.check("no text background" ((FigTest.hasSub(dump "fill=\"#F7F5F0\" d=\"M")) == true))
+        ; Nothing here is drawn wrong and nothing is left undrawn: the
+        ; shadow under the two cards reaches the painter now, with its own
+        ; alpha. A sticky's shadow is black at a tenth, and written without
+        ; the alpha it is black at one — a slab under the note instead of a
+        ; note lifted off the page.
+        this.eqInt("nothing is reported as undrawn" (array_length app.sceneDoc.warnings) 0)
+        def sceneJson:string (app.sceneJson())
+        this.check("the shadow reaches the display list" (FigTest.hasSub(sceneJson "\"sh\":{")))
+        ; And it is translucent where the file said so. A sticky's shadow is
+        ; black at a tenth; written as #000000 it is black at one, a slab
+        ; under the note instead of a note lifted off the page. The list
+        ; carries the alpha as the fourth channel of the shadow colour, so
+        ; anything but 1.00 there is the file's own number arriving.
+        this.check("with the alpha the file gave it" (FigTest.hasSub(sceneJson "\"c\":[0,0,0,0.10]}")))
+    }
+
+    ; A paste from Figma: fig-kiwi bytes with no ZIP, and only the copied
+    ; nodes, each pointing at a page that did not come along.
+    ; THE ANGLE A MATRIX IS TURNED BY, over the whole circle. Every layer
+    ; that is not upright is placed by this number, and Figma turns a layer
+    ; about its OWN ORIGIN — so an angle that is wrong does not merely tilt
+    ; the layer, it swings it off its own box. An image came out a quarter
+    ; turn further left than the file said and well above the rectangle the
+    ; editor draws around it, from one term of an arctangent approximation.
+    fn testRotationAngle:void () {
+        print "--- rotation angle ---"
+        ; The matrix from the board, to seven places: a plain -45 degree
+        ; turn, no mirror and no scale. It read as -134.76, which is the
+        ; approximation's answer for atan(-1) and a quarter turn out.
+        def m:SceneMatrix (SceneMatrix.fromFigma(0.7071068 0.7071068 521.0 (0.0 - 0.7071068) 0.7071068 463.0))
+        def got45:double (m.rotationDeg())
+        ; Within half a degree, not exact: this is an approximation and the
+        ; test is here to catch a QUARTER TURN, not a rounding.
+        this.check(("an eighth turn anticlockwise reads as -45, not -135 (got " + (to_string got45) + ")") ((fabs (got45 + 45.0)) < 0.5))
+        this.check("and is not mirrored" ((m.isMirrored()) == false))
+        this.check("nor a skew" (m.isSimilarity()))
+        ; And the whole circle, against the angle each matrix was built from.
+        ; The approximation is good to about a third of a degree; the bug it
+        ; replaces was out by up to 89.76, and only on one side, which is why
+        ; half the board looked right.
+        def worst:double 0.0
+        def deg:int (0 - 179)
+        while (deg <= 180) {
+            def t:double (((to_double deg) * 3.141592653589793) / 180.0)
+            def mm:SceneMatrix (SceneMatrix.fromFigma((cos t) (0.0 - (sin t)) 0.0 (sin t) (cos t) 0.0))
+            def got:double (mm.rotationDeg())
+            def err:double (fabs (got - (to_double deg)))
+            if (err > worst) {
+                worst = err
+            }
+            deg = (deg + 1)
+        }
+        this.check(("every angle on the circle is within a third of a degree (worst " + (to_string worst) + ")") (worst < 0.34))
+    }
+
+    fn testPaste:void () {
+        print "--- paste ---"
+        def app (new FigApp())
+        this.check("open loose layers" (app.openClipboardSample()))
+        this.check("flagged as a paste" app.doc.pasted)
+        this.check("canvas bytes kept" ((buffer_length app.doc.canvasBytes) > 16))
+        this.eqInt("one page" (app.pageCount()) 1)
+        def page:SceneNode (app.currentPage())
+        this.eqStr("synthetic page" page.name "Pasted")
+        this.eqStr("page type" page.sourceType "CANVAS")
+        this.eqInt("two roots" (array_length page.children) 2)
+        def card:SceneNode (page.childNamed("Card"))
+        this.eqStr("card kind" card.kind "container")
+        this.close("card x" card.x 640.0)
+        this.eqInt("card keeps its child" (array_length card.children) 1)
+        def dot:SceneNode (page.childNamed("Dot"))
+        this.eqStr("dot kind" dot.kind "ellipse")
+        this.check("frames list the card" (FigTest.hasSub((app.framesJson()) "Card")))
+        ; The same bytes a .fig keeps in canvas.fig open on their own too.
+        def whole (new FigApp())
+        this.check("open .fig" (whole.openSample()))
+        def again (new FigApp())
+        this.check("open its canvas bytes" (again.openBytes(whole.doc.canvasBytes "canvas")))
+        this.check("canvas bytes are a paste" again.doc.pasted)
+        this.eqInt("same pages" (again.pageCount()) (whole.pageCount()))
+        def bad (new FigApp())
+        this.check("garbage refused" ((bad.openBytes((buffer_alloc 40) "junk")) == false))
+    }
+
+    ; Every id in the subtree, counted. Returns how many were already there.
+    ; The ring `paintSelect` added, which is the last turned frame in the
+    ; list. -1 when there is none.
+    sfn lastFrameIndex:int (l:EVGDisplayList) {
+        def at:int (0 - 1)
+        def i:int 0
+        while (i < (array_length l.cmds)) {
+            def c:EVGDrawCmd (itemAt l.cmds i)
+            if ((c.kind == 1) && (c.hasRotOrigin)) {
+                at = i
+            }
+            i = (i + 1)
+        }
+        return at
+    }
+
+    sfn countDupIds:int (n:SceneNode seen:[string:int]) {
+        def dups:int 0
+        def had@(optional):int (get seen n.id)
+        if (null? had) {
+            set seen n.id 1
+        } {
+            dups = 1
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            dups = (dups + (FigTest.countDupIds((itemAt n.children i) seen)))
+            i = (i + 1)
+        }
+        return dups
+    }
+
+    sfn hasSub:boolean (s:string needle:string) {
+        def n:int (strlen s)
+        def m:int (strlen needle)
+        if (m > n) {
+            return false
+        }
+        def i:int 0
+        while (i <= (n - m)) {
+            def ok:boolean true
+            def j:int 0
+            while (j < m) {
+                if ((charAt s (i + j)) != (charAt needle j)) {
+                    ok = false
+                    j = m
+                }
+                j = (j + 1)
+            }
+            if ok {
+                return true
+            }
+            i = (i + 1)
+        }
+        return false
+    }
+}

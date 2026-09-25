@@ -1,0 +1,248 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; 2×3 affine matrix. Column form:
+;   x' = a*x + c*y + tx
+;   y' = b*x + d*y + ty
+; Figma's m00,m01,m02 / m10,m11,m12 maps to a,c,tx / b,d,ty.
+
+class SceneMatrix {
+    def a:double 1.0
+    def b:double 0.0
+    def c:double 0.0
+    def d:double 1.0
+    def tx:double 0.0
+    def ty:double 0.0
+
+    Constructor () {
+    }
+
+    sfn ident:SceneMatrix () {
+        return (new SceneMatrix())
+    }
+
+    sfn translate:SceneMatrix (x:double y:double) {
+        def m (new SceneMatrix())
+        m.tx = x
+        m.ty = y
+        return m
+    }
+
+    sfn fromFigma:SceneMatrix (m00:double m01:double m02:double m10:double m11:double m12:double) {
+        def m (new SceneMatrix())
+        m.a = m00
+        m.c = m01
+        m.tx = m02
+        m.b = m10
+        m.d = m11
+        m.ty = m12
+        return m
+    }
+
+    fn isIdent:boolean () {
+        if (a != 1.0) {
+            return false
+        }
+        if (d != 1.0) {
+            return false
+        }
+        if (b != 0.0) {
+            return false
+        }
+        if (c != 0.0) {
+            return false
+        }
+        if (tx != 0.0) {
+            return false
+        }
+        if (ty != 0.0) {
+            return false
+        }
+        return true
+    }
+
+    fn isTranslate:boolean () {
+        if (a != 1.0) {
+            return false
+        }
+        if (d != 1.0) {
+            return false
+        }
+        if (b != 0.0) {
+            return false
+        }
+        if (c != 0.0) {
+            return false
+        }
+        return true
+    }
+
+    fn mul:SceneMatrix (o:SceneMatrix) {
+        def r (new SceneMatrix())
+        r.a = ((a * o.a) + (c * o.b))
+        r.c = ((a * o.c) + (c * o.d))
+        r.tx = (((a * o.tx) + (c * o.ty)) + tx)
+        r.b = ((b * o.a) + (d * o.b))
+        r.d = ((b * o.c) + (d * o.d))
+        r.ty = (((b * o.tx) + (d * o.ty)) + ty)
+        return r
+    }
+
+    fn applyX:double (x:double y:double) {
+        return (((a * x) + (c * y)) + tx)
+    }
+
+    fn applyY:double (x:double y:double) {
+        return (((b * x) + (d * y)) + ty)
+    }
+
+    ; The point put back into the space this matrix rotated out of. The
+    ; renderer applies the ROTATION and nothing else (`SceneToEVG.applyXf`),
+    ; so the first column is normalised before it is undone: a matrix that
+    ; also carries a scale would otherwise send the hit test somewhere the
+    ; picture is not. For a plain rotation the inverse is the transpose,
+    ; which is what this is.
+    fn unrotX:double (x:double y:double) {
+        def len:double (sqrt ((a * a) + (b * b)))
+        if (len < 0.000001) {
+            return x
+        }
+        def co:double (a / len)
+        def si:double (b / len)
+        return ((co * x) + (si * y))
+    }
+
+    ; The mirror is its own inverse, so undoing `R · F` is `F` after the
+    ; turn: the y of the answer is the one that changes sign.
+    fn unrotY:double (x:double y:double) {
+        def len:double (sqrt ((a * a) + (b * b)))
+        if (len < 0.000001) {
+            return y
+        }
+        def co:double (a / len)
+        def si:double (b / len)
+        def uy:double (((0.0 - si) * x) + (co * y))
+        if (this.isMirrored()) {
+            return (0.0 - uy)
+        }
+        return uy
+    }
+
+    ; The turn AND the mirror, with any scale taken back out — which is
+    ; what the renderer applies. `R(theta) · diag(1, -1)` when the matrix
+    ; reverses handedness, plain `R(theta)` when it does not.
+    fn rotOnly:SceneMatrix () {
+        def m (new SceneMatrix())
+        def len:double (sqrt ((a * a) + (b * b)))
+        if (len < 0.000001) {
+            return m
+        }
+        def co:double (a / len)
+        def si:double (b / len)
+        m.a = co
+        m.b = si
+        if (this.isMirrored()) {
+            m.c = si
+            m.d = (0.0 - co)
+        } {
+            m.c = (0.0 - si)
+            m.d = co
+        }
+        return m
+    }
+
+    ; A MIRROR, not a turn. A matrix whose determinant is negative reverses
+    ; handedness, and no rotation does that: read as one, a mirrored layer
+    ; comes out backwards — an arrow with its head where its tail belongs.
+    ; What is left once the mirror is taken out IS a rotation, and it is the
+    ; same angle `rotationDeg` already answers: M = R(theta) · diag(1, -1).
+    fn isMirrored:boolean () {
+        return (((a * d) - (c * b)) < 0.0)
+    }
+
+    ; Whether this matrix is a SIMILARITY: a turn, one factor, and maybe a
+    ; mirror. That is all an angle and a factor can say, and it is all the
+    ; renderer applies — so a matrix that is anything else is drawn as the
+    ; nearest turn, which is a different picture. Two columns of the same
+    ; length, at right angles to each other, is the test.
+    fn isSimilarity:boolean () {
+        def l1:double (sqrt ((a * a) + (b * b)))
+        def l2:double (sqrt ((c * c) + (d * d)))
+        ; A matrix that collapses to nothing is not a skew — it is a layer
+        ; with no area, and it draws nothing either way. Reported as a skew
+        ; it is noise in a count that is meant to be read.
+        if ((l1 < 0.000001) || (l2 < 0.000001)) {
+            return true
+        }
+        def ratio:double (l1 / l2)
+        if ((fabs (ratio - 1.0)) > 0.01) {
+            return false
+        }
+        ; The dot product of the two columns, as a fraction of their size —
+        ; the cosine of the angle between them, so the tolerance is an angle
+        ; too. A hundredth is about half a degree, which is the rounding a
+        ; file's own floats carry: a rotation written to seven places has a
+        ; dot of a few thousandths and is not a skew.
+        def dot:double (((a * c) + (b * d)) / (l1 * l2))
+        return ((fabs dot) < 0.01)
+    }
+
+    ; The factor the turn is written with — the length of a column.
+    fn uniformScale:double () {
+        return (sqrt ((a * a) + (b * b)))
+    }
+
+    fn rotationDeg:double () {
+        def ang:double (SceneMatrix.atan2Approx(b a))
+        return ((ang * 180.0) / 3.141592653589793)
+    }
+
+    sfn atan2Approx:double (y:double x:double) {
+        if ((x == 0.0) && (y == 0.0)) {
+            return 0.0
+        }
+        if (x == 0.0) {
+            if (y > 0.0) {
+                return 1.5707963267948966
+            }
+            return (0.0 - 1.5707963267948966)
+        }
+        def r:double (y / x)
+        def absR:double r
+        if (absR < 0.0) {
+            absR = (0.0 - absR)
+        }
+        def a:double 0.0
+        if (absR < 1.0) {
+            ; Odd in r already, so the sign rides along.
+            a = (r / (1.0 + (0.28 * r * r)))
+        } {
+            ; AND SO IS THIS ONE, once it is given |r|. The formula is
+            ; pi/2 - r/(r*r + 0.28), and it holds for r >= 1 only: fed a
+            ; negative r it returns something past pi/2, and negating THAT —
+            ; which the line below does, correctly, for an odd function — put
+            ; the answer a quarter turn away. atan(-1) came back as -134.76
+            ; degrees instead of -45, and every angle steeper than 45 to the
+            ; other side was wrong by up to 89.76 of them.
+            ;
+            ; A layer turned -45 was drawn turned -135, and since Figma turns
+            ; a layer about its own origin, the extra quarter turn swung it
+            ; off its own box: an image landing far up and to the left of the
+            ; rectangle the editor draws around it.
+            a = (1.5707963267948966 - (absR / ((absR * absR) + 0.28)))
+            if (r < 0.0) {
+                a = (0.0 - a)
+            }
+        }
+        if (x < 0.0) {
+            if (y >= 0.0) {
+                return (a + 3.141592653589793)
+            }
+            return (a - 3.141592653589793)
+        }
+        return a
+    }
+
+    fn asJson:string () {
+        return ("{\"a\":" + (to_string a) + ",\"b\":" + (to_string b) + ",\"c\":" + (to_string c) + ",\"d\":" + (to_string d) + ",\"tx\":" + (to_string tx) + ",\"ty\":" + (to_string ty) + "}")
+    }
+}

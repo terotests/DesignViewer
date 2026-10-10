@@ -1,0 +1,166 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; One screen, or one part of one, as a document of its own.
+;
+; A presentation that shows the login screen of a 200 MB design file must
+; not have to open the file to do it. The file is opened ONCE, by whoever
+; keeps it, and every screen is cut out of it here: an EVG document the size
+; of the node, the node drawn at its origin, every layer under it keeping
+; its id. A part of the screen — the sign-in button — is then found in that
+; document by its id, and the file stays closed.
+;
+; The cut is the node as it stands, upright: a layer turned on its page is
+; shown the way it reads, since what was asked for is the thing, not where
+; it sits. A SCREEN gets its page's paper behind it, as Figma shows a frame
+; with no fill of its own; a part has nothing behind it, so it can go on a
+; slide of any colour.
+;
+; Pictures are not inside. `images` names the ones the node paints (the
+; names the file's `images/` entries have), and the document refers to them
+; by those names; the host keeps the bytes once for every screen.
+
+Import "pkg:evg/EVGElement.rgr"
+Import "pkg:evg/EVGTreeJson.rgr"
+Import "../scene/SceneNode.rgr"
+Import "../evg/SceneToEVG.rgr"
+
+class FigCut {
+    def ok:boolean false
+    def err:string ""
+    def id:string ""
+    def name:string ""
+    def w:double 0.0
+    def h:double 0.0
+    def screen:boolean false
+    def json:string ""
+    def images:[string]
+
+    Constructor () {
+    }
+}
+
+class FigCutter {
+    def byId:[string:SceneNode]
+    ; The page a node is on, and whether it is a screen (the top of a page
+    ; or of a section on it).
+    def pageOf:[string:SceneNode]
+    def screens:[string:boolean]
+
+    Constructor (scene:SceneDocument) {
+        def i:int 0
+        while (i < (array_length scene.pages)) {
+            def page:SceneNode (itemAt scene.pages i)
+            this.mapUnder(page page true)
+            i = (i + 1)
+        }
+    }
+
+    fn mapUnder:void (n:SceneNode page:SceneNode top:boolean) {
+        def j:int 0
+        while (j < (array_length n.children)) {
+            def c:SceneNode (itemAt n.children j)
+            if ((has byId c.id) == false) {
+                set byId c.id c
+                set pageOf c.id page
+            }
+            def section:boolean (c.sourceType == "SECTION")
+            if (top && (section == false)) {
+                set screens c.id true
+            }
+            this.mapUnder(c page (top && section))
+            j = (j + 1)
+        }
+    }
+
+    fn hasNode:boolean (id:string) {
+        return (has byId id)
+    }
+
+    fn cut:FigCut (id:string) {
+        def out (new FigCut())
+        out.id = id
+        def hit@(optional):SceneNode (get byId id)
+        if (null? hit) {
+            out.err = ("no layer " + id + " in this file")
+            return out
+        }
+        def n:SceneNode (unwrap hit)
+        def page:SceneNode (unwrap (get pageOf id))
+        out.name = n.name
+        out.screen = (has screens id)
+        def w:double n.w
+        def h:double n.h
+        if (w < 1.0) {
+            w = 1.0
+        }
+        if (h < 1.0) {
+            h = 1.0
+        }
+        out.w = w
+        out.h = h
+        ; Drawn at the origin and upright, then put back: the scene is the
+        ; host's and is cut again for the next screen.
+        def keepX:double n.x
+        def keepY:double n.y
+        def keepXf:boolean n.hasXf
+        n.x = 0.0
+        n.y = 0.0
+        n.hasXf = false
+        def em (new SceneToEVG())
+        def body:EVGElement (em.emit(n))
+        n.x = keepX
+        n.y = keepY
+        n.hasXf = keepXf
+        def root (EVGElement.createDiv())
+        root.setAttribute("position" "relative")
+        root.setAttribute("width" ((FigCutter.px(w)) + "px"))
+        root.setAttribute("height" ((FigCutter.px(h)) + "px"))
+        root.markInline("width")
+        root.markInline("height")
+        root.setAttribute("overflow" "hidden")
+        if out.screen {
+            if ((array_length page.fills) > 0) {
+                def bg:SceneFill (page.firstFill())
+                if ((bg.kind == "solid") && bg.visible) {
+                    root.setAttribute("background-color" (bg.hexA()))
+                }
+            }
+        }
+        root.addChild(body)
+        out.json = (EVGTreeJson.toText(root))
+        def seen:[string:boolean]
+        this.imagesOf(n out.images seen)
+        out.ok = true
+        return out
+    }
+
+    sfn px:string (v:double) {
+        def i:int (to_int (v + 0.5))
+        return (to_string i)
+    }
+
+    fn imagesOf:void (n:SceneNode out:[string] seen:[string:boolean]) {
+        if ((strlen n.imageRef) > 0) {
+            if ((has seen n.imageRef) == false) {
+                set seen n.imageRef true
+                push out n.imageRef
+            }
+        }
+        def i:int 0
+        while (i < (array_length n.fills)) {
+            def f:SceneFill (itemAt n.fills i)
+            if ((strlen f.imageRef) > 0) {
+                if ((has seen f.imageRef) == false) {
+                    set seen f.imageRef true
+                    push out f.imageRef
+                }
+            }
+            i = (i + 1)
+        }
+        def j:int 0
+        while (j < (array_length n.children)) {
+            this.imagesOf((itemAt n.children j) out seen)
+            j = (j + 1)
+        }
+    }
+}

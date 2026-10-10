@@ -1,0 +1,760 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; What a design file HOLDS, as a list a search can read without the file.
+;
+; A Figma export is one message with every node of every page in it, and the
+; only way into it is to decode the whole thing. Someone looking for "the
+; login screen" needs none of that: they need the screens' names, the words
+; on them, the parts worth pointing at and whatever the designer wrote down
+; about them. This is that list, made once from a parsed file and written as
+; JSON, so a host can keep it beside the file and answer from it.
+;
+; A SCREEN is what a designer draws an app's screens as: a top-level frame on
+; a page (FRAME, a component or a component set, an instance), or a frame at
+; the top of a SECTION, which is how a long page is organised. Anything else
+; on a page — a loose text, an arrow — is not a screen.
+;
+; The words come from the SCENE, not from the nodes: an instance's text lives
+; in its component and its overrides, and only the scene has them resolved to
+; what is on the screen. The metadata comes from the NODES, because the scene
+; does not carry it: descriptions, prototype links, flow starting points,
+; annotations and a section's dev status. A field the file does not have is
+; left out, never guessed.
+
+Import "../FigModel.rgr"
+Import "../scene/SceneNode.rgr"
+
+class FigIndexPart {
+    def id:string ""
+    def name:string ""
+    def type:string ""
+    def x:double 0.0
+    def y:double 0.0
+    def w:double 0.0
+    def h:double 0.0
+
+    Constructor () {
+    }
+}
+
+class FigIndexLink {
+    def from:string ""
+    def to:string ""
+
+    Constructor () {
+    }
+}
+
+class FigIndexScreen {
+    def id:string ""
+    def page:string ""
+    def pageName:string ""
+    def name:string ""
+    def section:string ""
+    def type:string ""
+    def x:double 0.0
+    def y:double 0.0
+    def w:double 0.0
+    def h:double 0.0
+    def text:string ""
+    def parts:[FigIndexPart]
+    def components:[string]
+    def links:[FigIndexLink]
+    def description:string ""
+    def flowStart:string ""
+    def status:string ""
+    def notes:[string]
+
+    Constructor () {
+    }
+}
+
+class FigIndexPage {
+    def id:string ""
+    def name:string ""
+    def screens:int 0
+
+    Constructor () {
+    }
+}
+
+class FigIndex {
+    def file:string ""
+    def background:string ""
+    def version:int 0
+    def nodeCount:int 0
+    def pages:[FigIndexPage]
+    def screens:[FigIndexScreen]
+
+    ; Room for the words of a screen. A search needs enough of them to find
+    ; it by what it says; a screen of terms and conditions does not need to
+    ; carry all of them into every search.
+    def textMax:int 4000
+    ; Parts per screen, and how deep under the screen they are looked for.
+    def partMax:int 40
+    def partDepth:int 3
+
+    def sceneById:[string:SceneNode]
+    def nodeById:[string:FigNode]
+    def screenOf:[string:string]
+
+    Constructor () {
+    }
+
+    sfn build:FigIndex (doc:FigDoc scene:SceneDocument) {
+        def ix (new FigIndex())
+        ix.fill(doc scene)
+        return ix
+    }
+
+    fn fill:void (doc:FigDoc scene:SceneDocument) {
+        file = doc.fileName
+        version = doc.version
+        nodeCount = (array_length doc.nodes)
+        def ni:int 0
+        while (ni < nodeCount) {
+            def each:FigNode (itemAt doc.nodes ni)
+            set nodeById each.id each
+            ni = (ni + 1)
+        }
+        def si:int 0
+        while (si < (array_length scene.pages)) {
+            this.mapScene((itemAt scene.pages si))
+            si = (si + 1)
+        }
+        def pi:int 0
+        while (pi < (array_length doc.pages)) {
+            def page:FigNode (itemAt doc.pages pi)
+            def pg (new FigIndexPage())
+            pg.id = page.id
+            pg.name = page.name
+            if (pi == 0) {
+                background = (FigIndex.pageBackground(page))
+            }
+            def before:int (array_length screens)
+            this.screensIn(page page "" "")
+            pg.screens = ((array_length screens) - before)
+            push pages pg
+            pi = (pi + 1)
+        }
+        ; Every node under a screen points at the screen, so a prototype
+        ; link to a button on another screen can be told as a link to that
+        ; screen. Done once the screens are known, then the links are read.
+        def ki:int 0
+        while (ki < (array_length screens)) {
+            def s:FigIndexScreen (itemAt screens ki)
+            this.markUnder((this.node(s.id)) s.id)
+            ki = (ki + 1)
+        }
+        def li:int 0
+        while (li < (array_length screens)) {
+            def s2:FigIndexScreen (itemAt screens li)
+            this.readMeta((this.node(s2.id)) s2)
+            li = (li + 1)
+        }
+    }
+
+    ; The node with that id, or an empty one: a component from a library
+    ; that did not come with the file is named and never present.
+    fn node:FigNode (id:string) {
+        def hit@(optional):FigNode (get nodeById id)
+        if (null? hit) {
+            return (new FigNode())
+        }
+        return (unwrap hit)
+    }
+
+    fn mapScene:void (n:SceneNode) {
+        if (has sceneById n.id) {
+        } {
+            set sceneById n.id n
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            this.mapScene((itemAt n.children i))
+            i = (i + 1)
+        }
+    }
+
+    fn markUnder:void (nd:FigNode screenId:string) {
+        set screenOf nd.id screenId
+        def i:int 0
+        while (i < (array_length nd.children)) {
+            this.markUnder((itemAt nd.children i) screenId)
+            i = (i + 1)
+        }
+    }
+
+    sfn isScreenType:boolean (t:string) {
+        if (t == "FRAME") {
+            return true
+        }
+        if (t == "SYMBOL") {
+            return true
+        }
+        if (t == "COMPONENT") {
+            return true
+        }
+        if (t == "COMPONENT_SET") {
+            return true
+        }
+        if (t == "INSTANCE") {
+            return true
+        }
+        return false
+    }
+
+    ; `status` is the section's dev status ("BUILD" is Figma's ready for
+    ; development), which the screens in it inherit.
+    fn screensIn:void (page:FigNode parent:FigNode section:string status:string) {
+        def i:int 0
+        while (i < (array_length parent.children)) {
+            def nd:FigNode (itemAt parent.children i)
+            if nd.visible {
+                if (nd.typeName == "SECTION") {
+                    def info:KiwiValue (nd.raw.child("sectionStatusInfo"))
+                    def st:string (nd.raw.childString("sectionStatus" ""))
+                    if (info.isNull() == false) {
+                        st = (info.childString("status" st))
+                    }
+                    if ((st == "NONE") || ((strlen st) == 0)) {
+                        st = status
+                    }
+                    this.screensIn(page nd nd.name st)
+                } {
+                    if (FigIndex.isScreenType(nd.typeName)) {
+                        this.addScreen(page nd section status)
+                    }
+                }
+            }
+            i = (i + 1)
+        }
+    }
+
+    fn addScreen:void (page:FigNode nd:FigNode section:string status:string) {
+        def s (new FigIndexScreen())
+        s.status = status
+        s.id = nd.id
+        s.page = page.id
+        s.pageName = page.name
+        s.name = nd.name
+        s.section = section
+        s.type = (FigIndex.typeWord(nd.typeName))
+        s.w = nd.w
+        s.h = nd.h
+        s.x = nd.m02
+        s.y = nd.m12
+        def hit@(optional):SceneNode (get sceneById nd.id)
+        if (!null? hit) {
+            def sn:SceneNode (unwrap hit)
+            s.x = sn.x
+            s.y = sn.y
+            def words:[string]
+            this.wordsOf(sn words)
+            s.text = (FigIndex.clip((FigIndex.joinWords(words)) textMax))
+            def ci:int 0
+            while (ci < (array_length sn.children)) {
+                this.partsOf((itemAt sn.children ci) s 1 0.0 0.0)
+                ci = (ci + 1)
+            }
+        }
+        push screens s
+    }
+
+    ; "SYMBOL" is what a file calls a component; nobody else does.
+    sfn typeWord:string (t:string) {
+        if (t == "SYMBOL") {
+            return "COMPONENT"
+        }
+        return t
+    }
+
+    fn wordsOf:void (n:SceneNode out:[string]) {
+        if (n.visible == false) {
+            return
+        }
+        if (n.kind == "text") {
+            def t:string (trim n.text.characters)
+            if ((strlen t) > 0) {
+                push out t
+            }
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            this.wordsOf((itemAt n.children i) out)
+            i = (i + 1)
+        }
+    }
+
+    ; A part is a layer someone named: a "Sign in button", a "Header". The
+    ; names a tool gives every new layer ("Frame 12", "Rectangle", "Vector")
+    ; say nothing and are skipped, and so are texts and shapes, whose name is
+    ; their content or nothing. Positions are in the screen's own space.
+    fn partsOf:void (n:SceneNode s:FigIndexScreen depth:int ox:double oy:double) {
+        if (n.visible == false) {
+            return
+        }
+        if ((array_length s.parts) >= partMax) {
+            return
+        }
+        def x:double (ox + n.x)
+        def y:double (oy + n.y)
+        if (FigIndex.namesAPart(n)) {
+            def p (new FigIndexPart())
+            p.id = n.id
+            p.name = n.name
+            p.type = (FigIndex.typeWord(n.sourceType))
+            p.x = x
+            p.y = y
+            p.w = n.w
+            p.h = n.h
+            push s.parts p
+        }
+        if (depth >= partDepth) {
+            return
+        }
+        def i:int 0
+        while (i < (array_length n.children)) {
+            this.partsOf((itemAt n.children i) s (depth + 1) x y)
+            i = (i + 1)
+        }
+    }
+
+    sfn namesAPart:boolean (n:SceneNode) {
+        if (n.kind != "container") {
+            return false
+        }
+        if ((n.w < 1.0) || (n.h < 1.0)) {
+            return false
+        }
+        return (FigIndex.isOwnName(n.name))
+    }
+
+    ; False for an empty name and for a name a design tool made up: one of
+    ; its default words, alone or followed by a number.
+    sfn isOwnName:boolean (name:string) {
+        def t:string (trim name)
+        if ((strlen t) == 0) {
+            return false
+        }
+        def head:string t
+        def sp:int (FigIndex.lastSpace(t))
+        if (sp > 0) {
+            def tail:string (substring t (sp + 1) (strlen t))
+            if (FigIndex.allDigits(tail)) {
+                head = (substring t 0 sp)
+            }
+        }
+        def low:string (to_lowercase head)
+        def defaults:[string] ([] _:string ("frame" "group" "rectangle" "ellipse" "line" "vector" "polygon" "star" "image" "container" "section" "component" "instance" "auto layout" "layer" "union" "subtract" "intersect" "exclude" "slice" "text" "arrow"))
+        def i:int 0
+        while (i < (array_length defaults)) {
+            if (low == (itemAt defaults i)) {
+                return false
+            }
+            i = (i + 1)
+        }
+        return true
+    }
+
+    sfn lastSpace:int (s:string) {
+        def at:int (0 - 1)
+        def i:int 0
+        while (i < (strlen s)) {
+            if ((charAt s i) == 32) {
+                at = i
+            }
+            i = (i + 1)
+        }
+        return at
+    }
+
+    sfn allDigits:boolean (s:string) {
+        if ((strlen s) == 0) {
+            return false
+        }
+        def i:int 0
+        while (i < (strlen s)) {
+            def c:int (charAt s i)
+            if ((c < 48) || (c > 57)) {
+                return false
+            }
+            i = (i + 1)
+        }
+        return true
+    }
+
+    ; Words joined by single spaces, every run of white space inside them
+    ; folded to one: a text box's line breaks are layout, not content. The
+    ; words are cut only at ASCII white space and copied whole between, so
+    ; text outside ASCII (an emoji, a ä) comes through on every target,
+    ; whatever unit its strings count in.
+    sfn joinWords:string (words:[string]) {
+        def out:string ""
+        def i:int 0
+        while (i < (array_length words)) {
+            def w:string (itemAt words i)
+            def n:int (strlen w)
+            def start:int 0
+            def j:int 0
+            while (j <= n) {
+                def c:int 32
+                if (j < n) {
+                    c = (charAt w j)
+                }
+                if ((c == 32) || (c == 10) || (c == 13) || (c == 9)) {
+                    if (j > start) {
+                        if ((strlen out) > 0) {
+                            out = (out + " ")
+                        }
+                        out = (out + (substring w start j))
+                    }
+                    start = (j + 1)
+                }
+                j = (j + 1)
+            }
+            i = (i + 1)
+        }
+        return out
+    }
+
+    ; At most `max` units, cut after the last whole word that fits. A string
+    ; with no space in reach is cut where it must be, stepped back off the
+    ; middle of a character: a UTF-8 continuation byte where strings count
+    ; bytes, the low half of a surrogate pair where they count UTF-16.
+    sfn clip:string (s:string max:int) {
+        if ((strlen s) <= max) {
+            return s
+        }
+        def cut:int max
+        while ((cut > 0) && ((charAt s cut) != 32)) {
+            cut = (cut - 1)
+        }
+        if (cut == 0) {
+            cut = max
+            while ((cut > 0) && (FigIndex.midChar((charAt s cut)))) {
+                cut = (cut - 1)
+            }
+        }
+        return (substring s 0 cut)
+    }
+
+    sfn midChar:boolean (c:int) {
+        if ((c >= 128) && (c < 192)) {
+            return true
+        }
+        return ((c >= 56320) && (c < 57344))
+    }
+
+    fn readMeta:void (nd:FigNode s:FigIndexScreen) {
+        def raw:KiwiValue nd.raw
+        def d:string (raw.childString("description" ""))
+        if ((strlen d) == 0) {
+            d = (raw.childString("symbolDescription" ""))
+        }
+        s.description = (trim d)
+        def sp:KiwiValue (raw.child("prototypeStartingPoint"))
+        if (sp.isNull() == false) {
+            def fname:string (trim (sp.childString("name" "")))
+            if ((strlen fname) == 0) {
+                fname = s.name
+            }
+            s.flowStart = fname
+        }
+        def seen:[string:boolean]
+        this.metaUnder(nd s seen)
+    }
+
+    ; Components used, links out and notes, from every node under a screen.
+    fn metaUnder:void (nd:FigNode s:FigIndexScreen seen:[string:boolean]) {
+        def raw:KiwiValue nd.raw
+        if ((strlen nd.symbolId) > 0) {
+            def master:FigNode (this.node(nd.symbolId))
+            def cname:string (trim master.name)
+            if ((strlen cname) > 0) {
+                def key:string ("c:" + cname)
+                if ((has seen key) == false) {
+                    set seen key true
+                    push s.components cname
+                }
+            }
+        }
+        this.linkTo(nd.id (FigModel.guidOf((raw.child("transitionNodeID")))) s seen)
+        def acts:KiwiValue (raw.child("prototypeInteractions"))
+        def ai:int 0
+        while (ai < (acts.itemCount())) {
+            def inter:KiwiValue (acts.item(ai))
+            if ((inter.childBool("isDeleted" false)) == false) {
+                def list:KiwiValue (inter.child("actions"))
+                def bi:int 0
+                while (bi < (list.itemCount())) {
+                    def act:KiwiValue (list.item(bi))
+                    this.linkTo(nd.id (FigModel.guidOf((act.child("transitionNodeID")))) s seen)
+                    bi = (bi + 1)
+                }
+            }
+            ai = (ai + 1)
+        }
+        def notes:KiwiValue (raw.child("annotations"))
+        def ni:int 0
+        while (ni < (notes.itemCount())) {
+            def note:KiwiValue (notes.item(ni))
+            def label:string (trim (note.childString("labelV2" "")))
+            if ((strlen label) == 0) {
+                label = (trim (note.childString("label" "")))
+            }
+            if ((strlen label) > 0) {
+                push s.notes label
+            }
+            ni = (ni + 1)
+        }
+        def ci:int 0
+        while (ci < (array_length nd.children)) {
+            this.metaUnder((itemAt nd.children ci) s seen)
+            ci = (ci + 1)
+        }
+    }
+
+    ; A link is kept only when it lands on ANOTHER screen of this file: a
+    ; jump within the screen (an overlay, a scroll to) is not a way through
+    ; the design, and a target outside the file cannot be shown.
+    fn linkTo:void (from:string target:string s:FigIndexScreen seen:[string:boolean]) {
+        if ((strlen target) == 0) {
+            return
+        }
+        if (target == "0:0") {
+            return
+        }
+        def dest@(optional):string (get screenOf target)
+        if (null? dest) {
+            return
+        }
+        def to:string (unwrap dest)
+        if (to == s.id) {
+            return
+        }
+        def key:string ("l:" + from + ">" + to)
+        if (has seen key) {
+            return
+        }
+        set seen key true
+        def l (new FigIndexLink())
+        l.from = from
+        l.to = to
+        push s.links l
+    }
+
+    ; The page's paper, as #rrggbb, or "" when the page has none.
+    sfn pageBackground:string (page:FigNode) {
+        def bg:KiwiValue (page.raw.child("backgroundColor"))
+        if (bg.isNull()) {
+            return ""
+        }
+        def r:int (FigIndex.channel((bg.childDouble("r" 0.0))))
+        def g:int (FigIndex.channel((bg.childDouble("g" 0.0))))
+        def b:int (FigIndex.channel((bg.childDouble("b" 0.0))))
+        return ("#" + (FigIndex.hex2(r)) + (FigIndex.hex2(g)) + (FigIndex.hex2(b)))
+    }
+
+    sfn channel:int (v:double) {
+        def i:int (to_int ((v * 255.0) + 0.5))
+        if (i < 0) {
+            return 0
+        }
+        if (i > 255) {
+            return 255
+        }
+        return i
+    }
+
+    sfn hex2:string (n:int) {
+        def d:string "0123456789abcdef"
+        def hi:int (idiv n 16)
+        def lo:int (n - (hi * 16))
+        return ((substring d hi (hi + 1)) + (substring d lo (lo + 1)))
+    }
+
+    fn screenById@(optional):FigIndexScreen (id:string) {
+        def r@(optional):FigIndexScreen
+        def i:int 0
+        while (i < (array_length screens)) {
+            def s:FigIndexScreen (itemAt screens i)
+            if (s.id == id) {
+                r = s
+                return r
+            }
+            i = (i + 1)
+        }
+        return r
+    }
+
+    ; The index as JSON, the shape a host keeps beside the file. `fileId`,
+    ; `sha` and `bytes` are the host's to add: this side never saw the
+    ; upload.
+    fn toJson:string () {
+        def o:string "{\"v\":1"
+        o = (o + ",\"file\":" + (FigIndex.str(file)))
+        o = (o + ",\"meta\":{\"fileName\":" + (FigIndex.str(file)))
+        if ((strlen background) > 0) {
+            o = (o + ",\"background\":" + (FigIndex.str(background)))
+        }
+        o = (o + ",\"version\":" + (to_string version) + ",\"nodes\":" + (to_string nodeCount) + "}")
+        o = (o + ",\"pages\":[")
+        def i:int 0
+        while (i < (array_length pages)) {
+            def p:FigIndexPage (itemAt pages i)
+            if (i > 0) {
+                o = (o + ",")
+            }
+            o = (o + "{\"id\":" + (FigIndex.str(p.id)) + ",\"name\":" + (FigIndex.str(p.name)) + ",\"screens\":" + (to_string p.screens) + "}")
+            i = (i + 1)
+        }
+        o = (o + "],\"screens\":[")
+        def j:int 0
+        while (j < (array_length screens)) {
+            if (j > 0) {
+                o = (o + ",")
+            }
+            o = (o + (this.screenJson((itemAt screens j))))
+            j = (j + 1)
+        }
+        return (o + "]}")
+    }
+
+    fn screenJson:string (s:FigIndexScreen) {
+        def o:string ("{\"id\":" + (FigIndex.str(s.id)))
+        o = (o + ",\"page\":" + (FigIndex.str(s.page)) + ",\"name\":" + (FigIndex.str(s.name)))
+        if ((strlen s.section) > 0) {
+            o = (o + ",\"section\":" + (FigIndex.str(s.section)))
+        }
+        o = (o + ",\"type\":" + (FigIndex.str(s.type)))
+        o = (o + ",\"x\":" + (FigIndex.num(s.x)) + ",\"y\":" + (FigIndex.num(s.y)))
+        o = (o + ",\"w\":" + (FigIndex.num(s.w)) + ",\"h\":" + (FigIndex.num(s.h)))
+        o = (o + ",\"text\":" + (FigIndex.str(s.text)))
+        o = (o + ",\"parts\":[")
+        def i:int 0
+        while (i < (array_length s.parts)) {
+            def p:FigIndexPart (itemAt s.parts i)
+            if (i > 0) {
+                o = (o + ",")
+            }
+            o = (o + "{\"id\":" + (FigIndex.str(p.id)) + ",\"name\":" + (FigIndex.str(p.name)) + ",\"type\":" + (FigIndex.str(p.type)))
+            o = (o + ",\"x\":" + (FigIndex.num(p.x)) + ",\"y\":" + (FigIndex.num(p.y)) + ",\"w\":" + (FigIndex.num(p.w)) + ",\"h\":" + (FigIndex.num(p.h)) + "}")
+            i = (i + 1)
+        }
+        o = (o + "]")
+        if ((array_length s.components) > 0) {
+            o = (o + ",\"components\":" + (FigIndex.strList(s.components)))
+        }
+        if ((array_length s.links) > 0) {
+            o = (o + ",\"links\":[")
+            def k:int 0
+            while (k < (array_length s.links)) {
+                def l:FigIndexLink (itemAt s.links k)
+                if (k > 0) {
+                    o = (o + ",")
+                }
+                o = (o + "{\"from\":" + (FigIndex.str(l.from)) + ",\"to\":" + (FigIndex.str(l.to)) + "}")
+                k = (k + 1)
+            }
+            o = (o + "]")
+        }
+        if ((strlen s.description) > 0) {
+            o = (o + ",\"description\":" + (FigIndex.str(s.description)))
+        }
+        if ((strlen s.flowStart) > 0) {
+            o = (o + ",\"flowStart\":" + (FigIndex.str(s.flowStart)))
+        }
+        if ((strlen s.status) > 0) {
+            o = (o + ",\"status\":" + (FigIndex.str(s.status)))
+        }
+        if ((array_length s.notes) > 0) {
+            o = (o + ",\"notes\":" + (FigIndex.strList(s.notes)))
+        }
+        return (o + "}")
+    }
+
+    sfn strList:string (list:[string]) {
+        def o:string "["
+        def i:int 0
+        while (i < (array_length list)) {
+            if (i > 0) {
+                o = (o + ",")
+            }
+            o = (o + (FigIndex.str((itemAt list i))))
+            i = (i + 1)
+        }
+        return (o + "]")
+    }
+
+    ; A whole number is written without a fraction, anything else rounded to
+    ; two places: a layer at 182.671875 is at 182.67 for anyone reading this.
+    sfn num:string (v:double) {
+        def neg:boolean (v < 0.0)
+        def a:double v
+        if neg {
+            a = (0.0 - v)
+        }
+        def cents:int (to_int ((a * 100.0) + 0.5))
+        def whole:int (idiv cents 100)
+        def frac:int (cents - (whole * 100))
+        def out:string (to_string whole)
+        if (frac > 0) {
+            if (frac < 10) {
+                out = (out + ".0" + (to_string frac))
+            } {
+                if ((frac - ((idiv frac 10) * 10)) == 0) {
+                    out = (out + "." + (to_string (idiv frac 10)))
+                } {
+                    out = (out + "." + (to_string frac))
+                }
+            }
+        }
+        if (neg && (cents > 0)) {
+            out = ("-" + out)
+        }
+        return out
+    }
+
+    sfn str:string (s:string) {
+        def o:string "\""
+        def start:int 0
+        def i:int 0
+        def n:int (strlen s)
+        while (i < n) {
+            def c:int (charAt s i)
+            def esc:string ""
+            if (c == 34) {
+                esc = "\\\""
+            }
+            if (c == 92) {
+                esc = "\\\\"
+            }
+            if (c == 10) {
+                esc = "\\n"
+            }
+            if (c == 13) {
+                esc = "\\r"
+            }
+            if (c == 9) {
+                esc = "\\t"
+            }
+            if ((strlen esc) == 0) {
+                if ((c < 32) || (c == 8232) || (c == 8233)) {
+                    esc = ("\\u" + (FigIndex.hex4(c)))
+                }
+            }
+            if ((strlen esc) > 0) {
+                o = (o + (substring s start i) + esc)
+                start = (i + 1)
+            }
+            i = (i + 1)
+        }
+        o = (o + (substring s start n))
+        return (o + "\"")
+    }
+
+    sfn hex4:string (c:int) {
+        return ((FigIndex.hex2((idiv c 256))) + (FigIndex.hex2((c - ((idiv c 256) * 256)))))
+    }
+}

@@ -13,6 +13,8 @@ Import "evg/SceneToEVG.rgr"
 Import "pkg:evg/EVGTreeJson.rgr"
 Import "write/SceneToFig.rgr"
 Import "write/EvgToScene.rgr"
+Import "index/FigIndex.rgr"
+Import "index/FigCut.rgr"
 
 class FigCli {
     sfn main:void () {
@@ -26,6 +28,8 @@ class FigCli {
             print "       fig_cli to-evg  <in.fig> <out.evg.json> [page]   one page, as an editable document"
             print "       fig_cli from-evg <in.evg.json> <out.fig> [w h]   an editable document, as a file"
             print "       fig_cli pack <out.fig> <w> <h> <in.evg.json>...   several screens, side by side"
+            print "       fig_cli index <in.fig> <out.json>   pages, screens, their words and metadata"
+            print "       fig_cli cut <in.fig> <node-id> <out.evg.json>   one screen or part, as a document"
             return
         }
         def cmd:string (shell_arg 0)
@@ -75,6 +79,51 @@ class FigCli {
         ; A page, as an editable EVG document. From here the whole agent
         ; toolchain works on a Figma file: outline for addresses, patch for
         ; changes, measure for a verdict, and the PNG tool for a picture.
+        ; What the file holds, as JSON a search can read without the file.
+        if (cmd == "index") {
+            if (n < 3) {
+                print "usage: fig_cli index <in.fig> <out.json>"
+                return
+            }
+            def srcI:string (shell_arg 1)
+            def docI:FigDoc (FigCli.load(srcI))
+            if (docI.ok == false) {
+                print ("cannot read " + srcI + ": " + docI.err)
+                return
+            }
+            def convI (new FigToScene())
+            def sceneI:SceneDocument (convI.convertDoc(docI))
+            def ix:FigIndex (FigIndex.build(docI sceneI))
+            def destI:string (shell_arg 2)
+            write_file (FigCli.dirOf(destI)) (FigCli.nameOf(destI)) (ix.toJson())
+            print ((("wrote " + destI) + " (" + (to_string (array_length ix.screens))) + " screens)")
+            return
+        }
+        ; One screen, or one layer of one, cut out as a document of its own.
+        if (cmd == "cut") {
+            if (n < 4) {
+                print "usage: fig_cli cut <in.fig> <node-id> <out.evg.json>"
+                return
+            }
+            def srcC:string (shell_arg 1)
+            def docC:FigDoc (FigCli.load(srcC))
+            if (docC.ok == false) {
+                print ("cannot read " + srcC + ": " + docC.err)
+                return
+            }
+            def convC (new FigToScene())
+            def cutter (new FigCutter((convC.convertDoc(docC))))
+            def cut:FigCut (cutter.cut((shell_arg 2)))
+            if (cut.ok == false) {
+                print cut.err
+                return
+            }
+            def destC:string (shell_arg 3)
+            write_file (FigCli.dirOf(destC)) (FigCli.nameOf(destC)) cut.json
+            def wroteC:int (FigCli.writeNamedImages(docC cut.images (FigCli.dirOf(destC))))
+            print ((("wrote " + destC) + " (" + cut.name) + ", " + (to_string wroteC) + " image(s) beside it)")
+            return
+        }
         if (cmd == "to-evg") {
             if (n < 3) {
                 print "usage: fig_cli to-evg <in.fig> <out.evg.json> [page]"
@@ -388,6 +437,38 @@ class FigCli {
     ; Every image in the archive, on disk next to the document. Returns how
     ; many, so the caller can say so rather than leave it to be discovered by a
     ; render that fails.
+    sfn load:FigDoc (path:string) {
+        def raw@(optional):buffer (buffer_read_file (FigCli.dirOf(path)) (FigCli.nameOf(path)))
+        if (null? raw) {
+            def none (new FigDoc())
+            none.ok = false
+            none.err = "no such file"
+            return none
+        }
+        def p (new FigParser())
+        return (p.parseBytes((unwrap raw) (FigCli.nameOf(path))))
+    }
+
+    sfn writeNamedImages:int (doc:FigDoc names:[string] dir:string) {
+        def n:int 0
+        def i:int 0
+        while (i < (array_length doc.images)) {
+            def im:FigImage (itemAt doc.images i)
+            def j:int 0
+            while (j < (array_length names)) {
+                if ((itemAt names j) == im.name) {
+                    if ((buffer_length im.bytes) > 0) {
+                        buffer_write_file dir im.name im.bytes
+                        n = (n + 1)
+                    }
+                }
+                j = (j + 1)
+            }
+            i = (i + 1)
+        }
+        return n
+    }
+
     sfn writeImages:int (doc:FigDoc dir:string) {
         def n:int 0
         def i:int 0

@@ -72,6 +72,38 @@ reader works on every target the compiler emits rather than only on
 JavaScript.
 
 
+## An index of a file, and one screen cut out of it
+
+A design file is opened once and asked what it holds; after that, nobody who
+only wants "the login screen" has to open it again.
+
+```bash
+node gallery/figma/bin/fig_cli.js index file.fig index.json          # pages, screens, words, metadata
+node gallery/figma/bin/fig_cli.js cut   file.fig 12:34 login.evg.json # one screen or part, with its images
+```
+
+`src/index/FigIndex.rgr` lists the **screens**: the top-level frames,
+components, component sets and instances of every page, and the frames at the
+top of a SECTION. For each: its id, page, name, section, size, the words on it
+(from the scene, so an instance says what its overrides say), the parts worth
+pointing at (named layers three levels down; "Frame 12", "Rectangle" and the
+other names a tool makes up are skipped) and the metadata the file carries:
+component descriptions, prototype links to other screens, flow starting
+points, annotations and a section's dev status. A field the file does not
+have is left out of the JSON.
+
+`src/index/FigCut.rgr` cuts one node out of the scene as an EVG document the
+node's size, drawn upright at the origin. Every layer under it keeps its id,
+so a part of a screen is found in the screen's cut without the file. A screen
+gets its page's paper behind it, a part nothing. The pictures it paints are
+listed by the names of the file's `images/` entries.
+
+Both are UI-independent and run on the Go target as they do on JavaScript —
+the index of `fixtures/health.fig` is byte for byte the same on both. That
+needed one fix in the reader: `KiwiBuffer.readString` wrote a character above
+the BMP as a surrogate pair, which is two replacement marks in a UTF-8
+string, so every emoji in a file read in Go came out as `��`.
+
 ## Writing: EVG → Figma, and back
 
 The reader had no counterpart, so a `.fig` was something this repository could

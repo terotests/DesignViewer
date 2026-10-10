@@ -23,6 +23,8 @@ Import "../src/convert/FigToScene.rgr"
 Import "../src/evg/SceneToEVG.rgr"
 Import "../src/scene/SceneNode.rgr"
 Import "../../../lib/zip/Inflate.rgr"
+Import "../src/index/FigIndex.rgr"
+Import "../src/index/FigCut.rgr"
 
 class FigTest {
     def passed:int 0
@@ -656,6 +658,10 @@ class FigTest {
         this.testVectorKeepsItsShape()
         this.testGradientSurvives()
         this.testImageSniffing()
+        this.testIndexHealth()
+        this.testIndexMeta()
+        this.testIndexNames()
+        this.testCut()
         print ""
         print ("passed = " + (to_string passed) + "  failed = " + (to_string failed))
         if (failed == 0) {
@@ -1817,6 +1823,210 @@ class FigTest {
             i = (i + 1)
         }
         return dups
+    }
+
+    ; --- the index: what a file holds, readable without the file -------------
+
+    fn healthDoc:FigDoc () {
+        def raw@(optional):buffer (buffer_read_file "gallery/figma/fixtures" "health.fig")
+        if (null? raw) {
+            return (new FigDoc())
+        }
+        def p (new FigParser())
+        return (p.parseBytes((unwrap raw) "health.fig"))
+    }
+
+    fn testIndexHealth:void () {
+        print "--- index: health.fig ---"
+        def doc:FigDoc (this.healthDoc())
+        this.check("parsed" doc.ok)
+        def conv (new FigToScene())
+        def scene:SceneDocument (conv.convertDoc(doc))
+        def ix:FigIndex (FigIndex.build(doc scene))
+        this.eqInt("one page" (array_length ix.pages) 1)
+        this.eqInt("three screens" (array_length ix.screens) 3)
+        def pg:FigIndexPage (itemAt ix.pages 0)
+        this.eqInt("the page counts its screens" pg.screens 3)
+        this.eqStr("the paper" ix.background "#f5f5f5")
+        def dash:FigIndexScreen (itemAt ix.screens 0)
+        this.eqStr("first screen" dash.name "Dashboard")
+        this.eqStr("its id" dash.id "1:2")
+        this.eqStr("a frame" dash.type "FRAME")
+        this.close("width" dash.w 402.0)
+        this.close("height" dash.h 1108.0)
+        this.check(("the words on it: " + (FigIndex.clip(dash.text 80))) (FigTest.hasSub(dash.text "SLEEP QUALITY")))
+        this.check("line breaks folded" ((FigTest.hasSub(dash.text "  ")) == false))
+        def act@(optional):FigIndexScreen (ix.screenById("1:147"))
+        if (!null? act) {
+            def actS:FigIndexScreen (unwrap act)
+            this.check("an emoji in the file reads as itself" (FigTest.hasSub(actS.text "reached 🔥 7")))
+        }
+        this.check("words from the first layer on" (FigTest.hasSub(dash.text "MONDAY, OCT 14")))
+        def partNames:string ""
+        def i:int 0
+        while (i < (array_length dash.parts)) {
+            def pt:FigIndexPart (itemAt dash.parts i)
+            partNames = (partNames + pt.name + "|")
+            this.check(("a part is not a default name: " + pt.name) (FigIndex.isOwnName(pt.name)))
+            i = (i + 1)
+        }
+        print ("    parts: " + partNames)
+        this.check("named layers are parts" (FigTest.hasSub(partNames "Header|")))
+        this.check("Container is a default name" ((FigTest.hasSub(partNames "Container")) == false))
+        def found@(optional):FigIndexScreen (ix.screenById("1:147"))
+        this.check("found by id" (!null? found))
+        def j:string (ix.toJson())
+        this.check("json opens" (FigTest.hasSub(j "{\"v\":1,\"file\":")))
+        this.check("json names the screen" (FigTest.hasSub(j "\"name\":\"Activity\"")))
+        this.check("json leaves out what is not there" ((FigTest.hasSub(j "\"links\"")) == false))
+    }
+
+    ; Metadata is read where the file has it. health.fig has none, so the
+    ; fields are put on the parsed nodes the way a real export carries them.
+    fn testIndexMeta:void () {
+        print "--- index: links, flows, descriptions, sections ---"
+        def p (new FigParser())
+        def doc:FigDoc (p.parseBytes((FigSample.buildFig()) "sample.fig"))
+        def card:FigNode (doc.nodeById("1:1"))
+        def swatches:FigNode (doc.nodeById("2:1"))
+        this.eqStr("the card" card.name "Card")
+        def child:FigNode (itemAt card.children 0)
+        child.raw.put("transitionNodeID" (FigTest.guid(3 1)))
+        def act (new KiwiValue())
+        act.kind = 6
+        act.put("transitionNodeID" (FigTest.guid(3 2)))
+        def acts (KiwiValue.fromArray())
+        acts.items = ([] _:KiwiValue (act))
+        def inter (new KiwiValue())
+        inter.kind = 6
+        inter.put("actions" acts)
+        def inters (KiwiValue.fromArray())
+        inters.items = ([] _:KiwiValue (inter))
+        card.raw.put("prototypeInteractions" inters)
+        ; one to itself, which is not a way through the design
+        card.raw.put("transitionNodeID" (FigTest.guid(1 1)))
+        card.raw.put("description" (KiwiValue.fromString("  The first thing a visitor sees  ")))
+        def start (new KiwiValue())
+        start.kind = 6
+        start.put("name" (KiwiValue.fromString("Onboarding")))
+        card.raw.put("prototypeStartingPoint" start)
+        def note (new KiwiValue())
+        note.kind = 6
+        note.put("labelV2" (KiwiValue.fromString("Copy is final")))
+        def notes (KiwiValue.fromArray())
+        notes.items = ([] _:KiwiValue (note))
+        child.raw.put("annotations" notes)
+        ; the swatches frame becomes a section, ready for development
+        swatches.typeName = "SECTION"
+        swatches.raw.put("sectionStatus" (KiwiValue.fromString("BUILD")))
+        def conv (new FigToScene())
+        def scene:SceneDocument (conv.convertDoc(doc))
+        def ix:FigIndex (FigIndex.build(doc scene))
+        def c@(optional):FigIndexScreen (ix.screenById("1:1"))
+        this.check("the card is a screen" (!null? c))
+        if (null? c) {
+            return
+        }
+        def cs:FigIndexScreen (unwrap c)
+        this.eqStr("description, trimmed" cs.description "The first thing a visitor sees")
+        this.eqStr("flow start" cs.flowStart "Onboarding")
+        this.eqInt("two links out, the one to itself dropped" (array_length cs.links) 2)
+        if ((array_length cs.links) < 2) {
+            return
+        }
+        def l0:FigIndexLink (itemAt cs.links 0)
+        this.eqStr("an action's link names the screen it lands on" l0.to "3:2")
+        this.eqStr("from the layer that has it" l0.from "1:1")
+        def l1:FigIndexLink (itemAt cs.links 1)
+        this.eqStr("a layer's own link too" l1.to "3:1")
+        this.eqStr("from that layer" l1.from child.id)
+        this.eqInt("the note" (array_length cs.notes) 1)
+        def sw@(optional):FigIndexScreen (ix.screenById("2:1"))
+        this.check("a section is not a screen" (null? sw))
+        def linked@(optional):FigIndexScreen (ix.screenById("3:40"))
+        this.check("an instance is a screen" (!null? linked))
+        if (!null? linked) {
+            def ls:FigIndexScreen (unwrap linked)
+            this.eqInt("it names its component" (array_length ls.components) 1)
+            this.eqStr("by the component's name" (FigTest.firstOf(ls.components)) "CardComponent")
+        }
+        def titled@(optional):FigIndexScreen (ix.screenById("3:48"))
+        if (!null? titled) {
+            def ts:FigIndexScreen (unwrap titled)
+            this.check(("an instance's words are its override: " + ts.text) (FigTest.hasSub(ts.text "The real text")))
+            this.check("not the component's" ((FigTest.hasSub(ts.text "Title text")) == false))
+        } {
+            this.check("the titled instance is a screen" false)
+        }
+        def j:string (ix.toJson())
+        this.check("json carries the flow" (FigTest.hasSub(j "\"flowStart\":\"Onboarding\"")))
+        this.check("json carries the links" (FigTest.hasSub(j "\"links\":[{\"from\":")))
+        this.check("json carries the note" (FigTest.hasSub(j "\"notes\":[\"Copy is final\"]")))
+    }
+
+    sfn firstOf:string (list:[string]) {
+        if ((array_length list) == 0) {
+            return ""
+        }
+        return (itemAt list 0)
+    }
+
+    sfn guid:KiwiValue (s:int l:int) {
+        def g (new KiwiValue())
+        g.kind = 6
+        g.put("sessionID" (KiwiValue.fromInt(s)))
+        g.put("localID" (KiwiValue.fromInt(l)))
+        return g
+    }
+
+    fn testIndexNames:void () {
+        print "--- index: what counts as a name ---"
+        this.check("Frame 12 is made up" ((FigIndex.isOwnName("Frame 12")) == false))
+        this.check("Rectangle is made up" ((FigIndex.isOwnName("Rectangle")) == false))
+        this.check("auto layout 3 is made up" ((FigIndex.isOwnName("Auto layout 3")) == false))
+        this.check("empty is no name" ((FigIndex.isOwnName("   ")) == false))
+        this.check("Sign in button is a name" (FigIndex.isOwnName("Sign in button")))
+        this.check("Frame two is a name" (FigIndex.isOwnName("Frame two")))
+        this.check("Header 2 is a name" (FigIndex.isOwnName("Header 2")))
+        this.eqStr("words joined" (FigIndex.joinWords(([] _:string ("Hello\nworld" "  again  ")))) "Hello world again")
+        this.eqStr("quotes escaped" (FigIndex.str("a \"b\" \\ c\n")) "\"a \\\"b\\\" \\\\ c\\n\"")
+        this.eqStr("clipped at a word" (FigIndex.clip("one two three" 9)) "one two")
+        this.eqStr("short is kept" (FigIndex.clip("one" 9)) "one")
+        this.eqStr("emoji kept whole" (FigIndex.joinWords(([] _:string ("goal 🔥" "done")))) "goal 🔥 done")
+        this.eqStr("a whole number" (FigIndex.num(402.0)) "402")
+        this.eqStr("two places" (FigIndex.num(182.671875)) "182.67")
+        this.eqStr("one place" (FigIndex.num(0.5)) "0.5")
+        this.eqStr("negative" (FigIndex.num((0.0 - 12.25))) "-12.25")
+    }
+
+    fn testCut:void () {
+        print "--- cut: one screen, one part ---"
+        def doc:FigDoc (this.healthDoc())
+        def conv (new FigToScene())
+        def scene:SceneDocument (conv.convertDoc(doc))
+        def cutter (new FigCutter(scene))
+        def c:FigCut (cutter.cut("1:147"))
+        this.check(("cut " + c.err) c.ok)
+        this.check("a screen" c.screen)
+        this.eqStr("named" c.name "Activity")
+        this.close("its width" c.w 402.0)
+        this.check("sized" (FigTest.hasSub(c.json "\"width\":\"402px\"")))
+        this.check("on the paper" (FigTest.hasSub(c.json "rgb(245,245,245)")))
+        def back@(optional):EVGElement (EVGTreeJson.fromText(c.json))
+        this.check("the cut reads back as EVG" (!null? back))
+        this.check("the other screens are not in it" ((FigTest.hasSub(c.json "\"1:2\"")) == false))
+        def dashCut:FigCut (cutter.cut("1:2"))
+        this.check("one picture under the dashboard" ((array_length dashCut.images) == 1))
+        def part:FigCut (cutter.cut("1:4"))
+        this.check("a part cuts" part.ok)
+        this.check("a part is not a screen" (part.screen == false))
+        this.check("nothing behind a part" ((FigTest.hasSub(part.json "rgb(245,245,245)")) == false))
+        this.check("the part at its origin" (FigTest.hasSub(part.json "\"id\":\"1:4\",\"props\":{\"position\":\"absolute\",\"width\":\"362px\",\"height\":\"92px\",\"left\":\"0px\",\"top\":\"0px\"")))
+        def again:FigCut (cutter.cut("1:2"))
+        this.check("cutting a part leaves the scene as it was" (again.json == dashCut.json))
+        def none:FigCut (cutter.cut("99:99"))
+        this.check("an unknown id is an error" (none.ok == false))
+        this.check(("and says so: " + none.err) (FigTest.hasSub(none.err "99:99")))
     }
 
     sfn hasSub:boolean (s:string needle:string) {

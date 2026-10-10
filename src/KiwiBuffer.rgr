@@ -4,6 +4,8 @@
 ; The float encoding is kiwi's own: exponent in the first eight bits, not
 ; IEEE layout on the wire. See evanw/kiwi ByteBuffer.readVarFloat.
 
+Import "pkg:evg/EVGCodepoint.rgr"
+
 class KiwiBuffer {
     def data:buffer (buffer_alloc 0)
     def pos:int 0
@@ -218,14 +220,10 @@ class KiwiBuffer {
             if (cp == 0) {
                 return out
             }
-            if (cp < 65536) {
-                out = (out + (strfromcode cp))
-            } {
-                def u:int (cp - 65536)
-                def hi:int ((bit_shr u 10) + 55296)
-                def lo:int ((bit_and u 1023) + 56320)
-                out = (out + (strfromcode hi) + (strfromcode lo))
-            }
+            ; A code point above the BMP is a surrogate pair where strings
+            ; are UTF-16 and ONE four-byte character where they are UTF-8;
+            ; a pair written into a UTF-8 string is two replacement marks.
+            out = (out + (EVGCodepoint.toStr(cp)))
             guard = (guard + 1)
         }
         return out

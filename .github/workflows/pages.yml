@@ -47,7 +47,12 @@ jobs:
             compiler
             lib
             dist
+            bin/git-http.mjs
+            ranger.json
+            ranger.lock
             scripts/rgr-suite.sh
+            scripts/deps.mjs
+            gallery/ts_parser/ranger.json
             gallery/zip
             gallery/zstd
             gallery/game_engine/v2/tests/harness
@@ -68,6 +73,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+
+      # EVG (lib/evg, lib/image) is not in Ranger's git: the root ranger.json
+      # pins it in terotests/evg and scripts/deps.mjs puts it in place.
+      - name: Fetch Ranger's pinned packages
+        working-directory: ranger
+        run: node scripts/deps.mjs
 
       - name: Test
         working-directory: ranger

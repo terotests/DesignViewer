@@ -1,0 +1,811 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; FigVariation — a change to a .fig kept as the change alone.
+;
+; The original file is never touched. A variation names what differs from
+; it, by node, and nothing else:
+;
+;   {
+;     "format":  "fig-delta/1",
+;     "copies":  [ { "of": "1:7", "sid": 9001, "dx": 0, "dy": 120 } ],
+;     "set":     { "1:9": { "textData.characters": "Hello", "visible": false } },
+;     "removed": [ "1:30" ]
+;   }
+;
+; Applied in that order to the file's own node list (FigEditDoc): copies add
+; whole subtrees under new guids, `set` writes field paths on nodes, removed
+; drops subtrees. Figma's file is itself a list of node CHANGES, so this is
+; the same shape it already thinks in, kept small:
+;
+;   * one value per node and path: a later write replaces the earlier one,
+;     and a write over "transform" retires "transform.m02"
+;   * a value equal to the original's is not kept: setting a field back
+;     makes the entry disappear, and a variation set back entirely is "{}"
+;   * a copy removed again disappears with everything set on it
+;
+; The edits a caller makes (`edit`) are the friendly ones — text, move,
+; resize, fill, hide — and each turns into field paths here, so the stored
+; form has one kind of entry whatever made it.
+
+Import "FigEdit.rgr"
+Import "KiwiJson.rgr"
+
+class FigVariation {
+    def delta:KiwiValue (KiwiValue.fromObject())
+    def errors:[string]
+    ; what the last `edit` did, one line per op, and the guids it made
+    def notes:[string]
+    def created:[string]
+
+    Constructor () {
+    }
+
+    sfn parse:FigVariation (json:string) {
+        def v (new FigVariation())
+        if ((strlen json) > 0) {
+            def p (new KiwiJson())
+            def d:KiwiValue (p.read(json))
+            if (p.ok == false) {
+                push v.errors ("variation: " + p.err)
+            } {
+                if (d.isObject()) {
+                    v.delta = d
+                }
+            }
+        }
+        v.delta.put("format" (KiwiValue.fromString("fig-delta/1")))
+        return v
+    }
+
+    fn toJson:string () {
+        def out:KiwiValue (KiwiValue.fromObject())
+        out.put("format" (KiwiValue.fromString("fig-delta/1")))
+        def c:KiwiValue (this.copies())
+        if ((c.itemCount()) > 0) {
+            out.put("copies" c)
+        }
+        def s:KiwiValue (this.sets())
+        if ((s.fieldCount()) > 0) {
+            out.put("set" s)
+        }
+        def r:KiwiValue (this.removed())
+        if ((r.itemCount()) > 0) {
+            out.put("removed" r)
+        }
+        return (KiwiJson.write(out))
+    }
+
+    fn copies:KiwiValue () {
+        def c:KiwiValue (delta.field("copies"))
+        if (c.isArray()) {
+            return c
+        }
+        def a:KiwiValue (KiwiValue.fromArray())
+        delta.put("copies" a)
+        return a
+    }
+
+    fn sets:KiwiValue () {
+        def s:KiwiValue (delta.field("set"))
+        if (s.isObject()) {
+            return s
+        }
+        def o:KiwiValue (KiwiValue.fromObject())
+        delta.put("set" o)
+        return o
+    }
+
+    fn removed:KiwiValue () {
+        def r:KiwiValue (delta.field("removed"))
+        if (r.isArray()) {
+            return r
+        }
+        def a:KiwiValue (KiwiValue.fromArray())
+        delta.put("removed" a)
+        return a
+    }
+
+    ; How big the change is, for a listing: "3 nodes changed, 1 copy, 2 removed".
+    fn summary:string () {
+        def parts:[string]
+        def s:int ((this.sets()).fieldCount())
+        def c:int ((this.copies()).itemCount())
+        def r:int ((this.removed()).itemCount())
+        if (s > 0) {
+            push parts ((to_string s) + (FigVariation.plural(s " node changed" " nodes changed")))
+        }
+        if (c > 0) {
+            push parts ((to_string c) + (FigVariation.plural(c " copy" " copies")))
+        }
+        if (r > 0) {
+            push parts ((to_string r) + " removed")
+        }
+        if ((array_length parts) == 0) {
+            return "same as the original"
+        }
+        return (join parts ", ")
+    }
+
+    sfn plural:string (n:int one:string many:string) {
+        if (n == 1) {
+            return one
+        }
+        return many
+    }
+
+    ; ---- applying ----
+
+    ; The variation written into `doc` (opened from the original). A node the
+    ; variation names and the file does not have is reported in `errors` and
+    ; skipped: the rest still applies.
+    fn applyTo:void (doc:FigEditDoc) {
+        def c:KiwiValue (this.copies())
+        def i:int 0
+        while (i < (c.itemCount())) {
+            def cp:KiwiValue (c.item(i))
+            def of:string (cp.childString("of" ""))
+            if ((doc.exists(of)) == false) {
+                push errors ("copy of " + of + ": no such node")
+            } {
+                FigVariation.copyInto(doc of (cp.childInt("sid" 0)) (cp.childDouble("dx" 0.0)) (cp.childDouble("dy" 0.0)))
+            }
+            i = (i + 1)
+        }
+        def s:KiwiValue (this.sets())
+        def j:int 0
+        while (j < (s.fieldCount())) {
+            def id:string (s.fieldNameAt(j))
+            def fields:KiwiValue (s.fieldAt(j))
+            def ndo@(optional):KiwiValue (doc.node(id))
+            if (null? ndo) {
+                push errors ("set on " + id + ": no such node")
+            } {
+                def nd:KiwiValue (unwrap ndo)
+                def k:int 0
+                while (k < (fields.fieldCount())) {
+                    FigVariation.setPath(nd (fields.fieldNameAt(k)) (fields.fieldAt(k)))
+                    k = (k + 1)
+                }
+            }
+            j = (j + 1)
+        }
+        def r:KiwiValue (this.removed())
+        def drop:[string]
+        def m:int 0
+        while (m < (r.itemCount())) {
+            def rid:string ((r.item(m)).asString(""))
+            if (doc.exists(rid)) {
+                def sub:[string] (doc.subtree(rid))
+                def q:int 0
+                while (q < (array_length sub)) {
+                    push drop (itemAt sub q)
+                    q = (q + 1)
+                }
+            } {
+                push errors ("remove " + rid + ": no such node")
+            }
+            m = (m + 1)
+        }
+        if ((array_length drop) > 0) {
+            doc.dropNodes(drop)
+        }
+    }
+
+    ; Subtree `of` cloned under session `sid`: local ids 1, 2, … in the order
+    ; parents-first, the top one beside the original and moved by dx, dy.
+    sfn copyInto:string (doc:FigEditDoc of:string sid:int dx:double dy:double) {
+        def sub:[string] (doc.subtree(of))
+        def map:[string:string]
+        def i:int 0
+        while (i < (array_length sub)) {
+            set map (itemAt sub i) ((to_string sid) + ":" + (to_string (i + 1)))
+            i = (i + 1)
+        }
+        def nc:KiwiValue (doc.nodes())
+        def j:int 0
+        while (j < (array_length sub)) {
+            def old:string (itemAt sub j)
+            def src:KiwiValue (unwrap (doc.node(old)))
+            def nd:KiwiValue (KiwiJson.clone(src))
+            nd.put("guid" (FigVariation.guid(sid (j + 1))))
+            def pi:KiwiValue (nd.field("parentIndex"))
+            if (pi.isObject()) {
+                if (j == 0) {
+                    pi.put("position" (KiwiValue.fromString(((pi.childString("position" "")) + "~" + (to_string sid)))))
+                } {
+                    def pid:string (FigModel.guidOf((pi.child("guid"))))
+                    if (has map pid) {
+                        def np:string (unwrap (get map pid))
+                        pi.put("guid" (FigVariation.guidOf(np)))
+                    }
+                }
+            }
+            if (j == 0) {
+                def name:string (nd.childString("name" ""))
+                nd.put("name" (KiwiValue.fromString(name)))
+                def tf:KiwiValue (nd.field("transform"))
+                if (tf.isObject()) {
+                    tf.put("m02" (KiwiValue.fromDouble(((tf.childDouble("m02" 0.0)) + dx))))
+                    tf.put("m12" (KiwiValue.fromDouble(((tf.childDouble("m12" 0.0)) + dy))))
+                }
+            }
+            nc.pushItem(nd)
+            j = (j + 1)
+        }
+        doc.reindex()
+        return ((to_string sid) + ":1")
+    }
+
+    sfn guid:KiwiValue (sid:int lid:int) {
+        def g:KiwiValue (KiwiValue.fromObject())
+        g.put("sessionID" (KiwiValue.fromInt(sid)))
+        g.put("localID" (KiwiValue.fromInt(lid)))
+        return g
+    }
+
+    sfn guidOf:KiwiValue (id:string) {
+        def at:int (indexOf id ":")
+        if (at < 0) {
+            return (FigVariation.guid(0 0))
+        }
+        def s@(optional):int (to_int (substring id 0 at))
+        def l@(optional):int (to_int (substring id (at + 1) (strlen id)))
+        return (FigVariation.guid((?? s 0) (?? l 0)))
+    }
+
+    ; ---- field paths: "textData.characters", "fillPaints.0.color.r" ----
+
+    sfn getPath:KiwiValue (nd:KiwiValue path:string) {
+        def segs:[string] (strsplit path ".")
+        def cur:KiwiValue nd
+        def i:int 0
+        while (i < (array_length segs)) {
+            def seg:string (itemAt segs i)
+            if (cur.isArray()) {
+                def ix@(optional):int (to_int seg)
+                if (null? ix) {
+                    return (KiwiValue.nilVal())
+                }
+                def at:int (unwrap ix)
+                if ((at < 0) || (at >= (cur.itemCount()))) {
+                    return (KiwiValue.nilVal())
+                }
+                cur = (cur.item(at))
+            } {
+                if ((cur.isObject()) == false) {
+                    return (KiwiValue.nilVal())
+                }
+                if ((cur.hasField(seg)) == false) {
+                    return (KiwiValue.nilVal())
+                }
+                cur = (cur.field(seg))
+            }
+            i = (i + 1)
+        }
+        return cur
+    }
+
+    ; Writes `v` at `path`, making the objects on the way; null removes the
+    ; field. False when the path runs through something that is not an
+    ; object or an array.
+    sfn setPath:boolean (nd:KiwiValue path:string v:KiwiValue) {
+        def segs:[string] (strsplit path ".")
+        def cur:KiwiValue nd
+        def last:int ((array_length segs) - 1)
+        def i:int 0
+        while (i < last) {
+            def seg:string (itemAt segs i)
+            if (cur.isArray()) {
+                def ix@(optional):int (to_int seg)
+                if (null? ix) {
+                    return false
+                }
+                def at:int (unwrap ix)
+                if ((at < 0) || (at >= (cur.itemCount()))) {
+                    return false
+                }
+                cur = (cur.item(at))
+            } {
+                if ((cur.isObject()) == false) {
+                    return false
+                }
+                def next:KiwiValue (cur.field(seg))
+                if (next.isNull()) {
+                    next = (KiwiValue.fromObject())
+                    cur.put(seg next)
+                }
+                cur = next
+            }
+            i = (i + 1)
+        }
+        def key:string (itemAt segs last)
+        if (cur.isArray()) {
+            def ix2@(optional):int (to_int key)
+            if (null? ix2) {
+                return false
+            }
+            def at2:int (unwrap ix2)
+            if ((at2 < 0) || (at2 >= (cur.itemCount()))) {
+                return false
+            }
+            set cur.items at2 (KiwiJson.clone(v))
+            return true
+        }
+        if ((cur.isObject()) == false) {
+            return false
+        }
+        if (v.isNull()) {
+            FigVariation.removeField(cur key)
+            return true
+        }
+        cur.put(key (KiwiJson.clone(v)))
+        return true
+    }
+
+    sfn removeField:void (obj:KiwiValue name:string) {
+        def at:int (obj.findField(name))
+        if (at < 0) {
+            return
+        }
+        def names:[string]
+        def vals:[KiwiValue]
+        def i:int 0
+        while (i < (array_length obj.fieldNames)) {
+            if (i != at) {
+                push names (itemAt obj.fieldNames i)
+                push vals (itemAt obj.fieldVals i)
+            }
+            i = (i + 1)
+        }
+        obj.fieldNames = names
+        obj.fieldVals = vals
+    }
+
+    ; ---- editing ----
+
+    ; Ops applied one by one to `work` (the original with this variation
+    ; already applied) and recorded here, compared against `base` (the
+    ; original untouched). An op that cannot apply is reported in `errors`
+    ; and the rest go on.
+    fn edit:void (base:FigEditDoc work:FigEditDoc ops:KiwiValue) {
+        def i:int 0
+        while (i < (ops.itemCount())) {
+            def op:KiwiValue (ops.item(i))
+            def before:int (array_length errors)
+            this.editOne(base work op)
+            if ((array_length errors) == before) {
+                push notes ("ok " + (op.childString("op" "")) + " " + (op.childString("node" "")))
+            }
+            i = (i + 1)
+        }
+    }
+
+    fn fail:void (op:KiwiValue msg:string) {
+        push errors ((op.childString("op" "?")) + " " + (op.childString("node" "")) + ": " + msg)
+    }
+
+    fn editOne:void (base:FigEditDoc work:FigEditDoc op:KiwiValue) {
+        def kind:string (op.childString("op" ""))
+        def id:string (op.childString("node" ""))
+        if (kind == "revert") {
+            this.revert(base work id)
+            return
+        }
+        def ndo@(optional):KiwiValue (work.node(id))
+        if (null? ndo) {
+            this.fail(op "no such node in this variation")
+            return
+        }
+        def nd:KiwiValue (unwrap ndo)
+        def type:string (nd.childString("type" ""))
+        if ((type == "DOCUMENT") || (type == "CANVAS")) {
+            if ((kind != "rename") && (kind != "set")) {
+                this.fail(op ("a " + type + " cannot be changed that way"))
+                return
+            }
+        }
+        if (kind == "text") {
+            if (type != "TEXT") {
+                this.fail(op ("not a text layer (" + type + ")"))
+                return
+            }
+            this.setText(base work id (op.childString("text" "")))
+            return
+        }
+        if (kind == "move") {
+            if (op.hasField("x")) {
+                this.put(base work id "transform.m02" (KiwiValue.fromDouble((op.childDouble("x" 0.0)))))
+            }
+            if (op.hasField("y")) {
+                this.put(base work id "transform.m12" (KiwiValue.fromDouble((op.childDouble("y" 0.0)))))
+            }
+            return
+        }
+        if (kind == "resize") {
+            if (op.hasField("w")) {
+                this.put(base work id "size.x" (KiwiValue.fromDouble((op.childDouble("w" 0.0)))))
+            }
+            if (op.hasField("h")) {
+                this.put(base work id "size.y" (KiwiValue.fromDouble((op.childDouble("h" 0.0)))))
+            }
+            return
+        }
+        if (kind == "fill") {
+            def paint:KiwiValue (FigVariation.solid((op.childString("color" ""))))
+            if (paint.isNull()) {
+                this.fail(op "color must be #rrggbb or #rrggbbaa")
+                return
+            }
+            def list:KiwiValue (KiwiValue.fromArray())
+            list.pushItem(paint)
+            this.put(base work id "fillPaints" list)
+            return
+        }
+        if ((kind == "hide") || (kind == "show")) {
+            this.put(base work id "visible" (KiwiValue.fromBool((kind == "show"))))
+            return
+        }
+        if (kind == "opacity") {
+            this.put(base work id "opacity" (KiwiValue.fromDouble((op.childDouble("value" 1.0)))))
+            return
+        }
+        if (kind == "rename") {
+            this.put(base work id "name" (KiwiValue.fromString((op.childString("name" "")))))
+            return
+        }
+        if (kind == "set") {
+            def path:string (op.childString("field" ""))
+            def top:string (itemAt (strsplit path ".") 0)
+            if (((strlen path) == 0) || (top == "guid") || (top == "type") || (top == "phase") || (top == "parentIndex")) {
+                this.fail(op "field must name a node field other than guid, type, phase or parentIndex")
+                return
+            }
+            def nodeDef:KiwiDef (work.schema.getDef("NodeChange"))
+            def known:boolean false
+            def f:int 0
+            while (f < (array_length nodeDef.fields)) {
+                def kf:KiwiField (itemAt nodeDef.fields f)
+                if (kf.name == top) {
+                    known = true
+                }
+                f = (f + 1)
+            }
+            if (known == false) {
+                this.fail(op ("this file's schema has no node field " + top))
+                return
+            }
+            this.put(base work id path (op.field("value")))
+            return
+        }
+        if (kind == "remove") {
+            this.remove(work id)
+            return
+        }
+        if (kind == "copy") {
+            def sid:int (this.nextSession(work))
+            def cp:KiwiValue (KiwiValue.fromObject())
+            cp.put("of" (KiwiValue.fromString(id)))
+            cp.put("sid" (KiwiValue.fromInt(sid)))
+            cp.put("dx" (KiwiValue.fromDouble((op.childDouble("dx" 0.0)))))
+            cp.put("dy" (KiwiValue.fromDouble((op.childDouble("dy" 0.0)))))
+            def cl:KiwiValue (this.copies())
+            cl.pushItem(cp)
+            def made:string (FigVariation.copyInto(work id sid (op.childDouble("dx" 0.0)) (op.childDouble("dy" 0.0))))
+            push created made
+            return
+        }
+        this.fail(op "unknown op (text, move, resize, fill, hide, show, opacity, rename, set, copy, remove, revert)")
+    }
+
+    ; A session id nothing in the file or in the copies uses.
+    fn nextSession:int (work:FigEditDoc) {
+        def top:int (work.maxSession + 1)
+        if (top < 9000) {
+            top = 9000
+        }
+        def c:KiwiValue (this.copies())
+        def i:int 0
+        while (i < (c.itemCount())) {
+            def s:int ((c.item(i)).childInt("sid" 0))
+            if (s >= top) {
+                top = (s + 1)
+            }
+            i = (i + 1)
+        }
+        return top
+    }
+
+    ; Records `path` = `v` on node `id` and writes it into `work`.
+    fn put:void (base:FigEditDoc work:FigEditDoc id:string path:string v:KiwiValue) {
+        def nd:KiwiValue (unwrap (work.node(id)))
+        if ((FigVariation.setPath(nd path v)) == false) {
+            push errors ("set " + id + " " + path + ": the path goes through a value that is not an object or a list")
+            return
+        }
+        this.record(base id path v)
+    }
+
+    fn record:void (base:FigEditDoc id:string path:string v:KiwiValue) {
+        def s:KiwiValue (this.sets())
+        def fields:KiwiValue (s.field(id))
+        if ((fields.isObject()) == false) {
+            fields = (KiwiValue.fromObject())
+            s.put(id fields)
+        }
+        ; the newest write goes last, and retires the paths under it
+        def i:int ((fields.fieldCount()) - 1)
+        while (i >= 0) {
+            def k:string (fields.fieldNameAt(i))
+            if ((k == path) || (FigVariation.under(k path))) {
+                FigVariation.removeField(fields k)
+            }
+            i = (i - 1)
+        }
+        def covered:boolean false
+        def j:int 0
+        while (j < (fields.fieldCount())) {
+            if (FigVariation.under(path (fields.fieldNameAt(j)))) {
+                covered = true
+            }
+            j = (j + 1)
+        }
+        def same:boolean false
+        if (covered == false) {
+            def bo@(optional):KiwiValue (base.node(id))
+            if (!null? bo) {
+                def bn:KiwiValue (unwrap bo)
+                same = (KiwiJson.same((FigVariation.getPath(bn path)) v))
+            }
+        }
+        if (same == false) {
+            fields.put(path (KiwiJson.clone(v)))
+        }
+        if ((fields.fieldCount()) == 0) {
+            FigVariation.removeField(s id)
+        }
+    }
+
+    ; "a.b.c" is under "a.b"
+    sfn under:boolean (path:string parent:string) {
+        def lp:int (strlen parent)
+        if ((strlen path) <= lp) {
+            return false
+        }
+        return ((substring path 0 (lp + 1)) == (parent + "."))
+    }
+
+    ; New text, and what goes with it: one line entry per line, the per
+    ; character styles kept as long as the text, and the shaped glyphs
+    ; dropped — they are the OLD words, and Figma shapes the text again
+    ; when it opens a file without them. A layer still named after its
+    ; text is renamed with it, as Figma does. Text set back to the
+    ; original takes all of that back out of the variation.
+    fn setText:void (base:FigEditDoc work:FigEditDoc id:string text:string) {
+        def paths:[string] ([] _:string ("textData.characters" "textData.lines" "textData.characterStyleIDs" "derivedTextData" "name"))
+        def bo@(optional):KiwiValue (base.node(id))
+        if (!null? bo) {
+            def bn:KiwiValue (unwrap bo)
+            if ((FigVariation.getPath(bn "textData.characters")).stringVal == text) {
+                def nd:KiwiValue (unwrap (work.node(id)))
+                def s:KiwiValue (this.sets())
+                def fields:KiwiValue (s.field(id))
+                def i:int 0
+                while (i < (array_length paths)) {
+                    def p:string (itemAt paths i)
+                    FigVariation.setPath(nd p (FigVariation.getPath(bn p)))
+                    if (fields.isObject()) {
+                        FigVariation.removeField(fields p)
+                    }
+                    i = (i + 1)
+                }
+                if (fields.isObject()) {
+                    if ((fields.fieldCount()) == 0) {
+                        FigVariation.removeField(s id)
+                    }
+                }
+                return
+            }
+        }
+        def cur:KiwiValue (unwrap (work.node(id)))
+        def old:string ((FigVariation.getPath(cur "textData.characters")).asString(""))
+        def name:string (cur.childString("name" ""))
+        this.put(base work id "textData.characters" (KiwiValue.fromString(text)))
+        def lines:KiwiValue (FigVariation.getPath(cur "textData.lines"))
+        if ((lines.isArray()) && ((lines.itemCount()) > 0)) {
+            def want:int ((array_length (strsplit text "\n")))
+            if (want != (lines.itemCount())) {
+                def nl:KiwiValue (KiwiValue.fromArray())
+                def k:int 0
+                while (k < want) {
+                    def src:KiwiValue (lines.item(k))
+                    if (k >= (lines.itemCount())) {
+                        src = (lines.item(((lines.itemCount()) - 1)))
+                    }
+                    nl.pushItem((KiwiJson.clone(src)))
+                    k = (k + 1)
+                }
+                this.put(base work id "textData.lines" nl)
+            }
+        }
+        def ids:KiwiValue (FigVariation.getPath(cur "textData.characterStyleIDs"))
+        if ((ids.isArray()) && ((ids.itemCount()) > 0)) {
+            def want2:int (strlen text)
+            if (want2 != (ids.itemCount())) {
+                def ni:KiwiValue (KiwiValue.fromArray())
+                def m:int 0
+                while (m < want2) {
+                    def at:int m
+                    if (at >= (ids.itemCount())) {
+                        at = ((ids.itemCount()) - 1)
+                    }
+                    ni.pushItem((KiwiJson.clone((ids.item(at)))))
+                    m = (m + 1)
+                }
+                this.put(base work id "textData.characterStyleIDs" ni)
+            }
+        }
+        if (cur.hasField("derivedTextData")) {
+            this.put(base work id "derivedTextData" (KiwiValue.nilVal()))
+        }
+        if ((name == old) && ((strlen old) > 0)) {
+            this.put(base work id "name" (KiwiValue.fromString(text)))
+        }
+    }
+
+    fn remove:void (work:FigEditDoc id:string) {
+        def sid:int (FigVariation.sessionOf(id))
+        def c:KiwiValue (this.copies())
+        def i:int 0
+        while (i < (c.itemCount())) {
+            def cp:KiwiValue (c.item(i))
+            if (((cp.childInt("sid" -1)) == sid) && ((id == ((to_string sid) + ":1")))) {
+                this.forgetCopy(i sid)
+                work.dropNodes((work.subtree(id)))
+                return
+            }
+            i = (i + 1)
+        }
+        def sub:[string] (work.subtree(id))
+        def s:KiwiValue (this.sets())
+        def j:int 0
+        while (j < (array_length sub)) {
+            FigVariation.removeField(s (itemAt sub j))
+            j = (j + 1)
+        }
+        def rl:KiwiValue (this.removed())
+        rl.pushItem((KiwiValue.fromString(id)))
+        work.dropNodes(sub)
+    }
+
+    ; A copy taken back, with everything set on its nodes.
+    fn forgetCopy:void (at:int sid:int) {
+        def c:KiwiValue (this.copies())
+        def keep:KiwiValue (KiwiValue.fromArray())
+        def i:int 0
+        while (i < (c.itemCount())) {
+            if (i != at) {
+                keep.pushItem((c.item(i)))
+            }
+            i = (i + 1)
+        }
+        delta.put("copies" keep)
+        def s:KiwiValue (this.sets())
+        def j:int ((s.fieldCount()) - 1)
+        while (j >= 0) {
+            def k:string (s.fieldNameAt(j))
+            if ((FigVariation.sessionOf(k)) == sid) {
+                FigVariation.removeField(s k)
+            }
+            j = (j - 1)
+        }
+        def r:KiwiValue (this.removed())
+        def rk:KiwiValue (KiwiValue.fromArray())
+        def m:int 0
+        while (m < (r.itemCount())) {
+            if ((FigVariation.sessionOf(((r.item(m)).asString("")))) != sid) {
+                rk.pushItem((r.item(m)))
+            }
+            m = (m + 1)
+        }
+        delta.put("removed" rk)
+    }
+
+    sfn sessionOf:int (id:string) {
+        def at:int (indexOf id ":")
+        if (at < 0) {
+            return -1
+        }
+        def s@(optional):int (to_int (substring id 0 at))
+        return (?? s -1)
+    }
+
+    ; One node back to the original (a copy: gone), or with no node the whole
+    ; variation. `work` is rebuilt from `base` with what is left.
+    fn revert:void (base:FigEditDoc work:FigEditDoc id:string) {
+        if ((strlen id) == 0) {
+            delta = (KiwiValue.fromObject())
+            work.resetFrom(base)
+            return
+        }
+        def sid:int (FigVariation.sessionOf(id))
+        def c:KiwiValue (this.copies())
+        def i:int 0
+        while (i < (c.itemCount())) {
+            if ((((c.item(i)).childInt("sid" -1)) == sid) && (id == ((to_string sid) + ":1"))) {
+                this.forgetCopy(i sid)
+                this.reapply(base work)
+                return
+            }
+            i = (i + 1)
+        }
+        FigVariation.removeField((this.sets()) id)
+        def r:KiwiValue (this.removed())
+        def rk:KiwiValue (KiwiValue.fromArray())
+        def m:int 0
+        while (m < (r.itemCount())) {
+            if (((r.item(m)).asString("")) != id) {
+                rk.pushItem((r.item(m)))
+            }
+            m = (m + 1)
+        }
+        delta.put("removed" rk)
+        this.reapply(base work)
+    }
+
+    fn reapply:void (base:FigEditDoc work:FigEditDoc) {
+        work.resetFrom(base)
+        this.applyTo(work)
+    }
+
+    ; "#rrggbb" / "#rrggbbaa" as a SOLID paint, null when it is neither.
+    sfn solid:KiwiValue (hex:string) {
+        def h:string hex
+        if (((strlen h) > 0) && ((charAt h 0) == 35)) {
+            h = (substring h 1 (strlen h))
+        }
+        def n:int (strlen h)
+        if ((n != 6) && (n != 8)) {
+            return (KiwiValue.nilVal())
+        }
+        def vals:[int]
+        def i:int 0
+        while (i < n) {
+            def a:int (FigVariation.hexDigit((charAt h i)))
+            def b:int (FigVariation.hexDigit((charAt h (i + 1))))
+            if ((a < 0) || (b < 0)) {
+                return (KiwiValue.nilVal())
+            }
+            push vals ((a * 16) + b)
+            i = (i + 2)
+        }
+        def alpha:double 1.0
+        if (n == 8) {
+            alpha = ((to_double (itemAt vals 3)) / 255.0)
+        }
+        def col:KiwiValue (KiwiValue.fromObject())
+        col.put("r" (KiwiValue.fromDouble(((to_double (itemAt vals 0)) / 255.0))))
+        col.put("g" (KiwiValue.fromDouble(((to_double (itemAt vals 1)) / 255.0))))
+        col.put("b" (KiwiValue.fromDouble(((to_double (itemAt vals 2)) / 255.0))))
+        col.put("a" (KiwiValue.fromDouble(1.0)))
+        def p:KiwiValue (KiwiValue.fromObject())
+        p.put("type" (KiwiValue.fromString("SOLID")))
+        p.put("color" col)
+        p.put("opacity" (KiwiValue.fromDouble(alpha)))
+        p.put("visible" (KiwiValue.fromBool(true)))
+        p.put("blendMode" (KiwiValue.fromString("NORMAL")))
+        return p
+    }
+
+    sfn hexDigit:int (c:int) {
+        if ((c >= 48) && (c <= 57)) {
+            return (c - 48)
+        }
+        if ((c >= 97) && (c <= 102)) {
+            return (c - 87)
+        }
+        if ((c >= 65) && (c <= 70)) {
+            return (c - 55)
+        }
+        return -1
+    }
+}

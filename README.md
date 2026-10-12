@@ -351,6 +351,23 @@ and rendered as a blank page** — the node tree, the types, the sizes and the
 fill counts were all exactly right. No structural check would have caught it.
 Rendering the file and looking at it did.
 
+## Editing a file in place, and variations
+
+`src/edit/` changes a `.fig` without the scene round trip, so nothing it does
+not touch is lost: the message is decoded with the file's own schema into
+`KiwiValue`s, nodes are changed by guid, and the message is encoded with the
+same schema. The schema chunk, the thumbnail, `meta.json` and `images/` go
+back as they came.
+
+| | |
+| --- | --- |
+| `FigEditDoc` | a file opened for changing: nodes by guid, children by position, `toFig()` writes it back; `extract(id)` keeps one layer (on its page, placed where it was) with the components and styles its fields name, and `toFigTrimmed()` writes only the pictures and blobs it still uses |
+| `FigVariation` | a change kept as the change alone (`fig-delta/1`): `copies`, `set` (field paths by node) and `removed`. `edit` takes friendly ops (`text`, `move`, `resize`, `fill`, `hide`, `show`, `opacity`, `rename`, `copy`, `remove`, `revert`, raw `set`) and records field paths; a value equal to the original's is dropped, so a variation set back is `{}` |
+| `KiwiJson` | JSON to `KiwiValue` and back, whole, and value equality |
+
+Changed text drops the node's `derivedTextData` (the old shaped glyphs):
+Figma shapes text again on open, and this reader then draws the string.
+
 ## EVG support (used, not extended)
 
 | Feature | EVG support |

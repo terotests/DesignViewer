@@ -25,6 +25,7 @@ Import "../src/scene/SceneNode.rgr"
 Import "../../../lib/zip/Inflate.rgr"
 Import "../src/index/FigIndex.rgr"
 Import "../src/index/FigCut.rgr"
+Import "../src/edit/FigVariation.rgr"
 
 class FigTest {
     def passed:int 0
@@ -662,6 +663,11 @@ class FigTest {
         this.testIndexMeta()
         this.testIndexNames()
         this.testCut()
+        this.testEditRoundTrip()
+        this.testVariation()
+        this.testVariationCompacts()
+        this.testExtract()
+        this.testKiwiJson()
         print ""
         print ("passed = " + (to_string passed) + "  failed = " + (to_string failed))
         if (failed == 0) {
@@ -1997,6 +2003,187 @@ class FigTest {
         this.eqStr("two places" (FigIndex.num(182.671875)) "182.67")
         this.eqStr("one place" (FigIndex.num(0.5)) "0.5")
         this.eqStr("negative" (FigIndex.num((0.0 - 12.25))) "-12.25")
+    }
+
+
+    fn healthBytes:buffer () {
+        def raw@(optional):buffer (buffer_read_file "gallery/figma/fixtures" "health.fig")
+        if (null? raw) {
+            return (buffer_alloc 0)
+        }
+        return (unwrap raw)
+    }
+
+    sfn nodeCount:int (doc:FigDoc) {
+        return ((doc.root.child("nodeChanges")).itemCount())
+    }
+
+    sfn nodeIn:KiwiValue (doc:FigDoc id:string) {
+        def nc:KiwiValue (doc.root.child("nodeChanges"))
+        def i:int 0
+        while (i < (nc.itemCount())) {
+            def nd:KiwiValue (nc.item(i))
+            if ((FigModel.guidOf((nd.child("guid")))) == id) {
+                return nd
+            }
+            i = (i + 1)
+        }
+        return (KiwiValue.nilVal())
+    }
+
+    ; Opened for editing and written straight back, a file keeps every node
+    ; and every field: the message is decoded and encoded with the file's
+    ; own schema, so nothing passes through the scene graph.
+    fn testEditRoundTrip:void () {
+        print "--- edit: a file written back unchanged ---"
+        def bytes:buffer (this.healthBytes())
+        def d:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        this.check(("opens " + d.err) d.ok)
+        this.eqInt("the archive's other entries kept" (array_length d.entryNames) 4)
+        def out:buffer (d.toFig())
+        def p (new FigParser())
+        def back:FigDoc (p.parseBytes(out "back.fig"))
+        this.check(("reads back " + back.err) back.ok)
+        this.eqInt("every node" (FigTest.nodeCount(back)) 415)
+        this.check("every field, as values" (KiwiJson.same(d.message back.root)))
+        this.eqInt("the picture comes along" (array_length back.images) 1)
+    }
+
+    fn testVariation:void () {
+        print "--- edit: a variation is the change alone ---"
+        def bytes:buffer (this.healthBytes())
+        def base:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        def work:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        def v:FigVariation (FigVariation.parse(""))
+        def ops:KiwiValue (KiwiJson.parse("[{\"op\":\"text\",\"node\":\"1:7\",\"text\":\"TUESDAY\\nOCT 15\"},{\"op\":\"fill\",\"node\":\"1:6\",\"color\":\"#ff000080\"},{\"op\":\"copy\",\"node\":\"1:9\",\"dy\":50},{\"op\":\"move\",\"node\":\"1:4\",\"x\":12},{\"op\":\"hide\",\"node\":\"1:5\"},{\"op\":\"nonsense\",\"node\":\"1:9\"},{\"op\":\"text\",\"node\":\"1:4\",\"text\":\"x\"}]"))
+        v.edit(base work ops)
+        this.eqInt("two ops refused" (array_length v.errors) 2)
+        this.check("an unknown op says so" (FigTest.hasSub((itemAt v.errors 0) "unknown op")))
+        this.check("text only on text" (FigTest.hasSub((itemAt v.errors 1) "not a text layer")))
+        this.eqStr("the copy's guid" (itemAt v.created 0) "9000:1")
+        def json:string (v.toJson())
+        this.check("text recorded" (FigTest.hasSub(json "\"textData.characters\":\"TUESDAY\\nOCT 15\"")))
+        this.check("one line entry per line" (FigTest.hasSub(json "\"textData.lines\":[")))
+        this.check("old glyphs dropped" (FigTest.hasSub(json "\"derivedTextData\":null")))
+        this.check("a layer named by its text renamed with it" (FigTest.hasSub(json "\"name\":\"TUESDAY\\nOCT 15\"")))
+        this.check("a move is two numbers, not the matrix" (FigTest.hasSub(json "\"transform.m02\":12")))
+        this.check("the copy is one entry" (FigTest.hasSub(json "\"copies\":[{\"of\":\"1:9\",\"sid\":9000,\"dx\":0,\"dy\":50}]")))
+        this.check("the variation is small" ((strlen json) < 1000))
+        ; stored, read back, applied to the original, written as a file
+        def v2:FigVariation (FigVariation.parse(json))
+        def w2:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        v2.applyTo(w2)
+        this.eqInt("applies cleanly" (array_length v2.errors) 0)
+        def p (new FigParser())
+        def back:FigDoc (p.parseBytes((w2.toFig()) "v.fig"))
+        this.check(("the variation is a file " + back.err) back.ok)
+        this.eqInt("one node more" (FigTest.nodeCount(back)) 416)
+        def t:KiwiValue (FigTest.nodeIn(back "1:7"))
+        def ttd:KiwiValue (t.child("textData"))
+        def tlines:KiwiValue (ttd.child("lines"))
+        this.eqStr("with the new text" (ttd.childString("characters" "")) "TUESDAY\nOCT 15")
+        this.eqInt("two lines" (tlines.itemCount()) 2)
+        this.check("and no stale glyphs" ((t.hasField("derivedTextData")) == false))
+        def c:KiwiValue (FigTest.nodeIn(back "9000:1"))
+        this.eqStr("the copy is there" (c.childString("name" "")) "YOUR HEALTH")
+        def cpi:KiwiValue (c.child("parentIndex"))
+        this.eqStr("beside the original" (FigModel.guidOf((cpi.child("guid")))) "1:8")
+        def src9:KiwiValue (FigTest.nodeIn(back "1:9"))
+        def tf9:KiwiValue (src9.child("transform"))
+        def tfc:KiwiValue (c.child("transform"))
+        def y9:double (tf9.childDouble("m12" 0.0))
+        this.check("moved down" (FigTest.near((tfc.childDouble("m12" 0.0)) (y9 + 50.0))))
+        def n5:KiwiValue (FigTest.nodeIn(back "1:5"))
+        this.check("hidden" ((n5.childBool("visible" true)) == false))
+        ; and the original is untouched
+        def op2 (new FigParser())
+        def orig:FigDoc (op2.parseBytes(bytes "health.fig"))
+        def o7:KiwiValue (FigTest.nodeIn(orig "1:7"))
+        def otd:KiwiValue (o7.child("textData"))
+        this.eqStr("the original keeps its text" (otd.childString("characters" "")) "MONDAY, OCT 14")
+        ; the file renders: scene and index still build
+        def conv (new FigToScene())
+        def scene:SceneDocument (conv.convertDoc(back))
+        def ix:FigIndex (FigIndex.build(back scene))
+        this.eqInt("its screens index" (array_length ix.screens) 3)
+    }
+
+    fn testVariationCompacts:void () {
+        print "--- edit: a value set back leaves the variation ---"
+        def bytes:buffer (this.healthBytes())
+        def base:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        def work:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        def v:FigVariation (FigVariation.parse(""))
+        v.edit(base work (KiwiJson.parse("[{\"op\":\"move\",\"node\":\"1:4\",\"x\":12},{\"op\":\"move\",\"node\":\"1:4\",\"x\":30},{\"op\":\"text\",\"node\":\"1:7\",\"text\":\"X\"}]")))
+        this.check("the later move wins" (FigTest.hasSub((v.toJson()) "\"transform.m02\":30")))
+        this.check("and the earlier is gone" ((FigTest.hasSub((v.toJson()) "\"transform.m02\":12")) == false))
+        def b4:KiwiValue (unwrap (base.node("1:4")))
+        def b4t:KiwiValue (b4.child("transform"))
+        def x0:double (b4t.childDouble("m02" 0.0))
+        def back:KiwiValue (KiwiValue.fromArray())
+        def mv:KiwiValue (KiwiValue.fromObject())
+        mv.put("op" (KiwiValue.fromString("move")))
+        mv.put("node" (KiwiValue.fromString("1:4")))
+        mv.put("x" (KiwiValue.fromDouble(x0)))
+        back.pushItem(mv)
+        v.edit(base work back)
+        v.edit(base work (KiwiJson.parse("[{\"op\":\"text\",\"node\":\"1:7\",\"text\":\"MONDAY, OCT 14\"}]")))
+        this.eqStr("set back, nothing is left" (v.toJson()) "{\"format\":\"fig-delta/1\"}")
+        this.eqStr("and it says so" (v.summary()) "same as the original")
+        v.edit(base work (KiwiJson.parse("[{\"op\":\"copy\",\"node\":\"1:9\"},{\"op\":\"fill\",\"node\":\"9000:1\",\"color\":\"#00ff00\"},{\"op\":\"remove\",\"node\":\"9000:1\"}]")))
+        this.eqStr("a copy removed takes its edits with it" (v.toJson()) "{\"format\":\"fig-delta/1\"}")
+        v.edit(base work (KiwiJson.parse("[{\"op\":\"remove\",\"node\":\"1:8\"},{\"op\":\"revert\",\"node\":\"1:8\"},{\"op\":\"fill\",\"node\":\"1:9\",\"color\":\"#0000ff\"}]")))
+        this.eqInt("a reverted removal brings the layer back" (array_length v.errors) 0)
+        this.check("and only the fill is left" (FigTest.hasSub((v.toJson()) "\"set\":{\"1:9\"")))
+        v.edit(base work (KiwiJson.parse("[{\"op\":\"revert\"}]")))
+        this.eqStr("revert with no node: all of it" (v.toJson()) "{\"format\":\"fig-delta/1\"}")
+        this.check("and the layers are as they were" (KiwiJson.same(work.message base.message)))
+        v.edit(base work (KiwiJson.parse("[{\"op\":\"set\",\"node\":\"1:9\",\"field\":\"noSuchField\",\"value\":1},{\"op\":\"set\",\"node\":\"1:9\",\"field\":\"guid\",\"value\":1},{\"op\":\"set\",\"node\":\"1:9\",\"field\":\"opacity\",\"value\":0.5}]")))
+        this.eqInt("raw sets checked against the file's schema" (array_length v.errors) 2)
+        this.check("a raw set records" (FigTest.hasSub((v.toJson()) "\"opacity\":0.5")))
+    }
+
+    fn testExtract:void () {
+        print "--- edit: one view out as its own file ---"
+        def bytes:buffer (this.healthBytes())
+        def d:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        this.eqStr("a screen extracts" (d.extract("1:147")) "")
+        def p (new FigParser())
+        def back:FigDoc (p.parseBytes((d.toFigTrimmed()) "activity.fig"))
+        this.check(("it is a file " + back.err) back.ok)
+        def dash:KiwiValue (FigTest.nodeIn(back "1:2"))
+        this.check("the other screens are gone" (dash.isNull()))
+        def act:KiwiValue (FigTest.nodeIn(back "1:147"))
+        this.check("the screen is there" ((act.childString("name" "")) == "Activity"))
+        this.check("the dashboard's picture went with the dashboard" ((array_length back.images) == 0))
+        this.check("smaller than the whole file" ((buffer_length (d.toFigTrimmed())) < (buffer_length bytes)))
+        def blobsLeft:int ((back.root.child("blobs")).itemCount())
+        def whole:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        this.check("only the blobs it uses" (blobsLeft < ((whole.message.child("blobs")).itemCount())))
+        def conv (new FigToScene())
+        def scene:SceneDocument (conv.convertDoc(back))
+        def ix:FigIndex (FigIndex.build(back scene))
+        this.eqInt("one screen in it" (array_length ix.screens) 1)
+        ; a nested layer comes out placed where it was on the page
+        def d2:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        def before:KiwiValue (d2.pageTransform("1:4"))
+        this.eqStr("a part extracts" (d2.extract("1:4")) "")
+        def nd:KiwiValue (unwrap (d2.node("1:4")))
+        this.eqStr("on the page now" (d2.parent("1:4")) "0:1")
+        this.check("at its place on the page" (KiwiJson.same((nd.child("transform")) before)))
+        def d3:FigEditDoc (FigEditDoc.open(bytes "health.fig"))
+        this.check("a page is refused" ((strlen (d3.extract("0:1"))) > 0))
+        this.check("an unknown layer is refused" (FigTest.hasSub((d3.extract("99:9")) "99:9")))
+    }
+
+    fn testKiwiJson:void () {
+        print "--- edit: JSON both ways ---"
+        def v:KiwiValue (KiwiJson.parse("{\"a\":[1,2.5,-3,\"x\\n\\u00e4\\\"\"],\"b\":null,\"c\":true,\"d\":{}}"))
+        this.eqStr("reads and writes" (KiwiJson.write(v)) "{\"a\":[1,2.5,-3,\"x\\nä\\\"\"],\"b\":null,\"c\":true,\"d\":{}}")
+        this.check("order does not matter" (KiwiJson.same((KiwiJson.parse("{\"x\":1,\"y\":2}")) (KiwiJson.parse("{\"y\":2.0,\"x\":1}")))))
+        def p (new KiwiJson())
+        p.read("{\"a\":")
+        this.check("broken JSON is an error" (p.ok == false))
     }
 
     fn testCut:void () {

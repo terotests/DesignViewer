@@ -1,0 +1,820 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; FigEdit — a .fig opened for changing, and written back as a .fig.
+;
+; The scene round trip (fig → scene → fig) keeps the picture and loses the
+; structure: instances come back expanded, masks as groups. An edit to a
+; file someone will open in Figma again has to keep everything it did not
+; touch, so this works one level lower, on the kiwi message itself:
+;
+;   canvas.fig ── schema chunk ─────────────────────────────► kept as it was
+;              └─ message ── decode with the file's own schema
+;                              │  NodeChange list, edited by guid
+;                              └─ encode with the same schema ──► deflate
+;   the archive's other entries (thumbnail, meta, images/) ───► kept
+;
+; A field the file carries and nothing here understands is decoded into a
+; KiwiValue and encoded back from it, so it survives untouched. What changes
+; is only what an edit names (FigVariation).
+
+Import "../../../zip/ZipReader.rgr"
+Import "../../../zip/ZipEntry.rgr"
+Import "../../../zip/ZipWriter.rgr"
+Import "../../../../lib/image/Deflate.rgr"
+Import "../FigCanvas.rgr"
+Import "../KiwiSchema.rgr"
+Import "../KiwiDecode.rgr"
+Import "../FigModel.rgr"
+Import "../write/FigThumb.rgr"
+Import "KiwiJson.rgr"
+
+class FigEditDoc {
+    def ok:boolean false
+    def err:string ""
+    def name:string ""
+    def schema:KiwiSchema (new KiwiSchema())
+    def rootType:string "Message"
+    def prelude:string "fig-kiwi"
+    def version:int 0
+    ; chunk 0 exactly as the file had it: the schema is never re-encoded
+    def schemaChunk:buffer (buffer_alloc 0)
+    def message:KiwiValue (KiwiValue.fromObject())
+    ; the archive around canvas.fig, in its own order, canvas.fig left out
+    def entryNames:[string]
+    def entryData:[buffer]
+    def pasted:boolean false
+    ; guid "s:l" → index in nodeChanges, parent guid, and children by position
+    def byId:[string:int]
+    def parentOf:[string:string]
+    def kids:[string:[string]]
+    def maxSession:int 0
+
+    Constructor () {
+    }
+
+    fn fail:FigEditDoc (msg:string) {
+        ok = false
+        err = msg
+        return this
+    }
+
+    sfn open:FigEditDoc (bytes:buffer fileName:string) {
+        def d (new FigEditDoc())
+        d.name = fileName
+        def canvasBytes:buffer (buffer_alloc 0)
+        if ((buffer_length bytes) >= 16) {
+            if (FigCanvas.startsFig((FigCanvas.asciiAt(bytes 0 8)))) {
+                d.pasted = true
+                canvasBytes = bytes
+            }
+        }
+        if (d.pasted == false) {
+            def zip (new ZipReader())
+            if ((zip.openBytes(bytes)) == false) {
+                return (d.fail("not a Figma file (no ZIP, no fig-kiwi bytes)"))
+            }
+            def found:boolean false
+            def names:[string] (zip.listFiles())
+            def i:int 0
+            while (i < (array_length names)) {
+                def fn:string (itemAt names i)
+                def eo@(optional):ZipEntry (zip.getEntry(fn))
+                if (!null? eo) {
+                    def e:ZipEntry (unwrap eo)
+                    def data:buffer (zip.extract(e))
+                    if ((found == false) && (FigEditDoc.isCanvasName(fn))) {
+                        found = true
+                        canvasBytes = data
+                    } {
+                        push d.entryNames fn
+                        push d.entryData data
+                    }
+                }
+                i = (i + 1)
+            }
+            if (found == false) {
+                return (d.fail("no canvas.fig inside the archive"))
+            }
+        }
+        def fig (new FigCanvas())
+        if ((fig.parse(canvasBytes)) == false) {
+            return (d.fail(fig.err))
+        }
+        d.prelude = fig.prelude
+        d.version = fig.version
+        def c0:FigChunk (itemAt fig.chunks 0)
+        d.schemaChunk = c0.bytes
+        if ((d.schema.decode(fig.schemaRaw)) == false) {
+            return (d.fail(("schema: " + d.schema.err)))
+        }
+        if ((d.schema.findDef("Message")) < 0) {
+            if ((d.schema.findDef("NodeChanges")) >= 0) {
+                d.rootType = "NodeChanges"
+            }
+        }
+        def dec (new KiwiDecode())
+        dec.init(d.schema)
+        d.message = (dec.decodeNamed(d.rootType fig.messageRaw))
+        if (dec.ok == false) {
+            return (d.fail(("message: " + dec.err)))
+        }
+        d.reindex()
+        d.ok = true
+        return d
+    }
+
+    sfn isCanvasName:boolean (fn:string) {
+        def l:int (strlen fn)
+        if (l < 10) {
+            return false
+        }
+        return ((substring fn (l - 10) l) == "canvas.fig")
+    }
+
+    fn nodes:KiwiValue () {
+        def nc:KiwiValue (message.field("nodeChanges"))
+        if (nc.isArray()) {
+            return nc
+        }
+        def a:KiwiValue (KiwiValue.fromArray())
+        message.put("nodeChanges" a)
+        return a
+    }
+
+    fn reindex:void () {
+        def m:[string:int]
+        byId = m
+        def p:[string:string]
+        parentOf = p
+        def k:[string:[string]]
+        kids = k
+        def nc:KiwiValue (this.nodes())
+        def n:int (nc.itemCount())
+        def i:int 0
+        while (i < n) {
+            def nd:KiwiValue (nc.item(i))
+            def g:KiwiValue (nd.child("guid"))
+            def id:string (FigModel.guidOf(g))
+            def sid:int (g.childInt("sessionID" 0))
+            if (sid > maxSession) {
+                maxSession = sid
+            }
+            set byId id i
+            i = (i + 1)
+        }
+        def j:int 0
+        while (j < n) {
+            def nd2:KiwiValue (nc.item(j))
+            def id2:string (FigModel.guidOf((nd2.child("guid"))))
+            def pi:KiwiValue (nd2.child("parentIndex"))
+            if (pi.isObject()) {
+                def pid:string (FigModel.guidOf((pi.child("guid"))))
+                if ((strlen pid) > 0) {
+                    set parentOf id2 pid
+                    if ((has kids pid) == false) {
+                        def fresh:[string]
+                        set kids pid fresh
+                    }
+                    ; set back: on some targets a list read out of a map
+                    ; is a copy, and growing it leaves the map's as it was
+                    def list:[string] (unwrap (get kids pid))
+                    set kids pid (this.insertByPosition(list id2 (pi.childString("position" ""))))
+                }
+            }
+            j = (j + 1)
+        }
+    }
+
+    ; Children keep the order Figma gives them: position strings, compared
+    ; character by character.
+    fn insertByPosition:[string] (list:[string] id:string pos:string) {
+        push list id
+        def i:int ((array_length list) - 1)
+        while (i > 0) {
+            def prev:string (itemAt list (i - 1))
+            def pp:string (this.positionOf(prev))
+            if ((FigEditDoc.compare(pp pos)) <= 0) {
+                return list
+            }
+            set list i prev
+            set list (i - 1) id
+            i = (i - 1)
+        }
+        return list
+    }
+
+    fn positionOf:string (id:string) {
+        def nd@(optional):KiwiValue (this.node(id))
+        if (null? nd) {
+            return ""
+        }
+        def pi:KiwiValue (nd.child("parentIndex"))
+        return (pi.childString("position" ""))
+    }
+
+    sfn compare:int (a:string b:string) {
+        def la:int (strlen a)
+        def lb:int (strlen b)
+        def i:int 0
+        while ((i < la) && (i < lb)) {
+            def ca:int (charAt a i)
+            def cb:int (charAt b i)
+            if (ca != cb) {
+                return (ca - cb)
+            }
+            i = (i + 1)
+        }
+        return (la - lb)
+    }
+
+    fn exists:boolean (id:string) {
+        return (has byId id)
+    }
+
+    fn node@(optional):KiwiValue (id:string) {
+        def r@(optional):KiwiValue
+        if ((has byId id) == false) {
+            return r
+        }
+        def ix:int (unwrap (get byId id))
+        r = ((this.nodes()).item(ix))
+        return r
+    }
+
+    fn parent:string (id:string) {
+        if (has parentOf id) {
+            return (unwrap (get parentOf id))
+        }
+        return ""
+    }
+
+    fn children:[string] (id:string) {
+        if (has kids id) {
+            return (unwrap (get kids id))
+        }
+        def none:[string]
+        return none
+    }
+
+    ; `id` and everything under it, parents before children.
+    fn subtree:[string] (id:string) {
+        def out:[string]
+        push out id
+        def i:int 0
+        while (i < (array_length out)) {
+            def ch:[string] (this.children((itemAt out i)))
+            def j:int 0
+            while (j < (array_length ch)) {
+                push out (itemAt ch j)
+                j = (j + 1)
+            }
+            i = (i + 1)
+        }
+        return out
+    }
+
+    fn typeOf:string (id:string) {
+        def nd@(optional):KiwiValue (this.node(id))
+        if (null? nd) {
+            return ""
+        }
+        return (nd.childString("type" ""))
+    }
+
+    ; The page (CANVAS) a node is on, "" for the document itself.
+    fn canvasOf:string (id:string) {
+        def cur:string id
+        def guard:int 0
+        while (((strlen cur) > 0) && (guard < 10000)) {
+            if ((this.typeOf(cur)) == "CANVAS") {
+                return cur
+            }
+            cur = (this.parent(cur))
+            guard = (guard + 1)
+        }
+        return ""
+    }
+
+    ; Drop nodes by guid (with nothing under them re-checked: the caller
+    ; passes whole subtrees).
+    fn dropNodes:void (ids:[string]) {
+        def gone:[string:boolean]
+        def i:int 0
+        while (i < (array_length ids)) {
+            set gone (itemAt ids i) true
+            i = (i + 1)
+        }
+        def nc:KiwiValue (this.nodes())
+        def keep:KiwiValue (KiwiValue.fromArray())
+        def j:int 0
+        while (j < (nc.itemCount())) {
+            def nd:KiwiValue (nc.item(j))
+            if ((has gone (FigModel.guidOf((nd.child("guid"))))) == false) {
+                keep.pushItem(nd)
+            }
+            j = (j + 1)
+        }
+        message.put("nodeChanges" keep)
+        this.reindex()
+    }
+
+    ; This document made the same as `base` again (a deep copy of its node
+    ; list, so the two can change apart).
+    fn resetFrom:void (base:FigEditDoc) {
+        message = (KiwiJson.clone(base.message))
+        maxSession = 0
+        this.reindex()
+    }
+
+    ; ---- reading, for someone about to edit ----
+
+    ; The layers under `id` as JSON: guid, type, name, place and size in the
+    ; parent, the text of a text layer, the first solid fill — what an edit
+    ; is aimed with. `depth` levels, at most `max` nodes.
+    fn layersJson:string (id:string depth:int max:int) {
+        def count:[int]
+        push count 0
+        return (this.layerJson(id depth max count))
+    }
+
+    fn layerJson:string (id:string depth:int max:int count:[int]) {
+        def nd:KiwiValue (unwrap (this.node(id)))
+        set count 0 ((itemAt count 0) + 1)
+        def o:string ("{\"id\":" + (KiwiJson.quote(id)) + ",\"type\":" + (KiwiJson.quote((nd.childString("type" "")))))
+        o = (o + ",\"name\":" + (KiwiJson.quote((nd.childString("name" "")))))
+        def tf:KiwiValue (nd.child("transform"))
+        if (tf.isObject()) {
+            o = (o + ",\"x\":" + (KiwiJson.num((FigEditDoc.round2((tf.childDouble("m02" 0.0)))))) + ",\"y\":" + (KiwiJson.num((FigEditDoc.round2((tf.childDouble("m12" 0.0)))))))
+        }
+        def sz:KiwiValue (nd.child("size"))
+        if (sz.isObject()) {
+            o = (o + ",\"w\":" + (KiwiJson.num((FigEditDoc.round2((sz.childDouble("x" 0.0)))))) + ",\"h\":" + (KiwiJson.num((FigEditDoc.round2((sz.childDouble("y" 0.0)))))))
+        }
+        if ((nd.childBool("visible" true)) == false) {
+            o = (o + ",\"hidden\":true")
+        }
+        def td:KiwiValue (nd.child("textData"))
+        if (td.isObject()) {
+            o = (o + ",\"text\":" + (KiwiJson.quote((td.childString("characters" "")))))
+        }
+        def fill:string (FigEditDoc.firstSolid((nd.child("fillPaints"))))
+        if ((strlen fill) > 0) {
+            o = (o + ",\"fill\":" + (KiwiJson.quote(fill)))
+        }
+        def ch:[string] (this.children(id))
+        if ((array_length ch) > 0) {
+            if ((depth > 0) && ((itemAt count 0) < max)) {
+                o = (o + ",\"children\":[")
+                def i:int 0
+                def wrote:int 0
+                while ((i < (array_length ch)) && ((itemAt count 0) < max)) {
+                    if (wrote > 0) {
+                        o = (o + ",")
+                    }
+                    o = (o + (this.layerJson((itemAt ch i) (depth - 1) max count)))
+                    wrote = (wrote + 1)
+                    i = (i + 1)
+                }
+                o = (o + "]")
+                if (wrote < (array_length ch)) {
+                    o = (o + ",\"more\":" + (to_string ((array_length ch) - wrote)))
+                }
+            } {
+                o = (o + ",\"childCount\":" + (to_string (array_length ch)))
+            }
+        }
+        return (o + "}")
+    }
+
+    sfn round2:double (v:double) {
+        def neg:boolean (v < 0.0)
+        def a:double v
+        if neg {
+            a = (0.0 - v)
+        }
+        def r:double ((to_double (to_int ((a * 100.0) + 0.5))) / 100.0)
+        if neg {
+            return (0.0 - r)
+        }
+        return r
+    }
+
+    sfn firstSolid:string (paints:KiwiValue) {
+        if ((paints.isArray()) == false) {
+            return ""
+        }
+        def i:int 0
+        while (i < (paints.itemCount())) {
+            def p:KiwiValue (paints.item(i))
+            if (((p.childString("type" "")) == "SOLID") && (p.childBool("visible" true))) {
+                def c:KiwiValue (p.child("color"))
+                def out:string ("#" + (FigEditDoc.hex2((c.childDouble("r" 0.0)))) + (FigEditDoc.hex2((c.childDouble("g" 0.0)))) + (FigEditDoc.hex2((c.childDouble("b" 0.0)))))
+                def a:double ((c.childDouble("a" 1.0)) * (p.childDouble("opacity" 1.0)))
+                if (a < 0.999) {
+                    out = (out + (FigEditDoc.hex2(a)))
+                }
+                return out
+            }
+            i = (i + 1)
+        }
+        return ""
+    }
+
+    sfn hex2:string (unit:double) {
+        def v:int (to_int ((unit * 255.0) + 0.5))
+        if (v < 0) {
+            v = 0
+        }
+        if (v > 255) {
+            v = 255
+        }
+        return (KiwiJson.hex2(v))
+    }
+
+    ; One node's own fields as JSON, for a "set" aimed at a field the
+    ; friendly ops do not cover. Derived geometry and shaped text are long
+    ; and are rewritten by Figma anyway, so they are named, not printed.
+    fn nodeJson:string (id:string) {
+        def nd:KiwiValue (unwrap (this.node(id)))
+        def out:KiwiValue (KiwiValue.fromObject())
+        def left:KiwiValue (KiwiValue.fromArray())
+        def i:int 0
+        while (i < (nd.fieldCount())) {
+            def k:string (nd.fieldNameAt(i))
+            if ((k == "derivedTextData") || (k == "fillGeometry") || (k == "strokeGeometry") || (k == "vectorData") || (k == "derivedSymbolData") || (k == "guid") || (k == "phase")) {
+                left.pushItem((KiwiValue.fromString(k)))
+            } {
+                out.put(k (nd.fieldAt(i)))
+            }
+            i = (i + 1)
+        }
+        out.put("id" (KiwiValue.fromString(id)))
+        if ((left.itemCount()) > 0) {
+            out.put("notShown" left)
+        }
+        return (KiwiJson.write(out))
+    }
+
+    ; ---- one view out of the file ----
+
+    ; Everything but layer `id` taken out: the document, the page it is on,
+    ; the layer under that page (placed where it was on the page), and what
+    ; it needs to draw — the components its instances use and the styles it
+    ; names, found by the guids its fields carry, with the pages those sit
+    ; on. "" when it worked, otherwise why not.
+    fn extract:string (id:string) {
+        if ((this.exists(id)) == false) {
+            return ("no layer " + id + " in this file")
+        }
+        def page:string (this.canvasOf(id))
+        if (((strlen page) == 0) || (page == id)) {
+            return ("layer " + id + " is not on a page (a whole page cannot be taken out)")
+        }
+        def nd:KiwiValue (unwrap (this.node(id)))
+        ; placed on the page directly, at the place it had on it
+        if ((this.parent(id)) != page) {
+            def abs:KiwiValue (this.pageTransform(id))
+            nd.put("transform" abs)
+            def pi:KiwiValue (nd.field("parentIndex"))
+            if (pi.isObject()) {
+                pi.put("guid" (KiwiJson.clone(((unwrap (this.node(page))).field("guid")))))
+            }
+            this.reindex()
+        }
+        def keep:[string:boolean]
+        def queue:[string]
+        def sub:[string] (this.subtree(id))
+        def i:int 0
+        while (i < (array_length sub)) {
+            set keep (itemAt sub i) true
+            push queue (itemAt sub i)
+            i = (i + 1)
+        }
+        def q:int 0
+        while (q < (array_length queue)) {
+            def refs:[string]
+            this.guidsIn((unwrap (this.node((itemAt queue q)))) refs true)
+            def r:int 0
+            while (r < (array_length refs)) {
+                def ref:string (itemAt refs r)
+                if ((this.exists(ref)) && ((has keep ref) == false)) {
+                    def rs:[string] (this.subtree(ref))
+                    def k:int 0
+                    while (k < (array_length rs)) {
+                        if ((has keep (itemAt rs k)) == false) {
+                            set keep (itemAt rs k) true
+                            push queue (itemAt rs k)
+                        }
+                        k = (k + 1)
+                    }
+                }
+                r = (r + 1)
+            }
+            q = (q + 1)
+        }
+        ; the parents of what is kept, up to the document, without their
+        ; other children
+        def kept:[string]
+        def all:[string] (this.allIds())
+        def a:int 0
+        while (a < (array_length all)) {
+            if (has keep (itemAt all a)) {
+                push kept (itemAt all a)
+            }
+            a = (a + 1)
+        }
+        def b:int 0
+        while (b < (array_length kept)) {
+            def up:string (this.parent((itemAt kept b)))
+            def guard:int 0
+            while (((strlen up) > 0) && ((has keep up) == false) && (guard < 10000)) {
+                set keep up true
+                up = (this.parent(up))
+                guard = (guard + 1)
+            }
+            b = (b + 1)
+        }
+        def drop:[string]
+        def c:int 0
+        while (c < (array_length all)) {
+            if ((has keep (itemAt all c)) == false) {
+                push drop (itemAt all c)
+            }
+            c = (c + 1)
+        }
+        this.dropNodes(drop)
+        this.keepBlobsUsed()
+        return ""
+    }
+
+    ; The message's blobs (glyph outlines, vector networks, geometry) are a
+    ; list the nodes name by index, in fields called …Blob. Only the ones
+    ; the nodes left still name are kept, renumbered: most of a file's
+    ; bytes are there, and a view of it should not carry the rest.
+    fn keepBlobsUsed:void () {
+        def blobs:KiwiValue (message.field("blobs"))
+        if ((blobs.isArray()) == false) {
+            return
+        }
+        def renum:[int]
+        def i:int 0
+        while (i < (blobs.itemCount())) {
+            push renum -1
+            i = (i + 1)
+        }
+        def nc:KiwiValue (this.nodes())
+        def j:int 0
+        while (j < (nc.itemCount())) {
+            this.blobRefs((nc.item(j)) renum false)
+            j = (j + 1)
+        }
+        def kept:KiwiValue (KiwiValue.fromArray())
+        def k:int 0
+        while (k < (array_length renum)) {
+            if ((itemAt renum k) >= 0) {
+                set renum k (kept.itemCount())
+                kept.pushItem((blobs.item(k)))
+            }
+            k = (k + 1)
+        }
+        def m:int 0
+        while (m < (nc.itemCount())) {
+            this.blobRefs((nc.item(m)) renum true)
+            m = (m + 1)
+        }
+        message.put("blobs" kept)
+    }
+
+    ; Marks (renumber false) or rewrites (true) the blob indexes under v.
+    fn blobRefs:void (v:KiwiValue renum:[int] rewrite:boolean) {
+        def i:int 0
+        while (i < (array_length v.items)) {
+            this.blobRefs((itemAt v.items i) renum rewrite)
+            i = (i + 1)
+        }
+        def j:int 0
+        while (j < (array_length v.fieldNames)) {
+            def name:string (itemAt v.fieldNames j)
+            def val:KiwiValue (itemAt v.fieldVals j)
+            def l:int (strlen name)
+            def isRef:boolean false
+            if ((l > 4) && (val.kind == 2)) {
+                isRef = ((substring name (l - 4) l) == "Blob")
+            }
+            if isRef {
+                def at:int val.intVal
+                if ((at >= 0) && (at < (array_length renum))) {
+                    if rewrite {
+                        set v.fieldVals j (KiwiValue.fromInt((itemAt renum at)))
+                    } {
+                        set renum at 0
+                    }
+                }
+            } {
+                this.blobRefs(val renum rewrite)
+            }
+            j = (j + 1)
+        }
+    }
+
+    fn allIds:[string] () {
+        def out:[string]
+        def nc:KiwiValue (this.nodes())
+        def i:int 0
+        while (i < (nc.itemCount())) {
+            push out (FigModel.guidOf(((nc.item(i)).child("guid"))))
+            i = (i + 1)
+        }
+        return out
+    }
+
+    ; Every {sessionID, localID} inside a node's fields (its own guid and
+    ; its parent excepted), as "s:l".
+    fn guidsIn:void (v:KiwiValue out:[string] top:boolean) {
+        if (v.isArray()) {
+            def i:int 0
+            while (i < (v.itemCount())) {
+                this.guidsIn((v.item(i)) out false)
+                i = (i + 1)
+            }
+            return
+        }
+        if ((v.isObject()) == false) {
+            return
+        }
+        if (((v.fieldCount()) == 2) && (v.hasField("sessionID")) && (v.hasField("localID"))) {
+            push out (FigModel.guidOf(v))
+            return
+        }
+        def j:int 0
+        while (j < (v.fieldCount())) {
+            def k:string (v.fieldNameAt(j))
+            if ((top == false) || ((k != "guid") && (k != "parentIndex"))) {
+                this.guidsIn((v.fieldAt(j)) out false)
+            }
+            j = (j + 1)
+        }
+    }
+
+    ; The names of the images/ entries the nodes paint: a paint names its
+    ; image by 20 raw bytes, the entry by their hex.
+    fn imagesUsed:[string:boolean] () {
+        def out:[string:boolean]
+        def nc:KiwiValue (this.nodes())
+        def i:int 0
+        while (i < (nc.itemCount())) {
+            this.hashesIn((nc.item(i)) out)
+            i = (i + 1)
+        }
+        return out
+    }
+
+    fn hashesIn:void (v:KiwiValue out:[string:boolean]) {
+        if (v.kind == 7) {
+            if ((buffer_length v.bytesVal) == 20) {
+                set out (FigModel.hexOf(v.bytesVal)) true
+            }
+            return
+        }
+        def i:int 0
+        while (i < (array_length v.items)) {
+            this.hashesIn((itemAt v.items i) out)
+            i = (i + 1)
+        }
+        def j:int 0
+        while (j < (array_length v.fieldVals)) {
+            this.hashesIn((itemAt v.fieldVals j) out)
+            j = (j + 1)
+        }
+    }
+
+    ; The extracted file: only the pictures still painted go with it.
+    fn toFigTrimmed:buffer () {
+        return (this.toFigKeeping((this.imagesUsed()) true))
+    }
+
+    ; Layer `id`'s transform composed with its parents' up to its page.
+    fn pageTransform:KiwiValue (id:string) {
+        def self:KiwiValue (unwrap (this.node(id)))
+        def m:[double] (FigEditDoc.matrixOf((self.child("transform"))))
+        def up:string (this.parent(id))
+        def guard:int 0
+        while (((strlen up) > 0) && ((this.typeOf(up)) != "CANVAS") && (guard < 10000)) {
+            def pn:KiwiValue (unwrap (this.node(up)))
+            def p:[double] (FigEditDoc.matrixOf((pn.child("transform"))))
+            m = (FigEditDoc.mul(p m))
+            up = (this.parent(up))
+            guard = (guard + 1)
+        }
+        def t:KiwiValue (KiwiValue.fromObject())
+        t.put("m00" (KiwiValue.fromDouble((itemAt m 0))))
+        t.put("m01" (KiwiValue.fromDouble((itemAt m 1))))
+        t.put("m02" (KiwiValue.fromDouble((itemAt m 2))))
+        t.put("m10" (KiwiValue.fromDouble((itemAt m 3))))
+        t.put("m11" (KiwiValue.fromDouble((itemAt m 4))))
+        t.put("m12" (KiwiValue.fromDouble((itemAt m 5))))
+        return t
+    }
+
+    sfn matrixOf:[double] (t:KiwiValue) {
+        def m:[double]
+        push m (t.childDouble("m00" 1.0))
+        push m (t.childDouble("m01" 0.0))
+        push m (t.childDouble("m02" 0.0))
+        push m (t.childDouble("m10" 0.0))
+        push m (t.childDouble("m11" 1.0))
+        push m (t.childDouble("m12" 0.0))
+        return m
+    }
+
+    ; a ∘ b for 2x3 affine matrices (row major, last column translation)
+    sfn mul:[double] (a:[double] b:[double]) {
+        def m:[double]
+        push m (((itemAt a 0) * (itemAt b 0)) + ((itemAt a 1) * (itemAt b 3)))
+        push m (((itemAt a 0) * (itemAt b 1)) + ((itemAt a 1) * (itemAt b 4)))
+        push m ((((itemAt a 0) * (itemAt b 2)) + ((itemAt a 1) * (itemAt b 5))) + (itemAt a 2))
+        push m (((itemAt a 3) * (itemAt b 0)) + ((itemAt a 4) * (itemAt b 3)))
+        push m (((itemAt a 3) * (itemAt b 1)) + ((itemAt a 4) * (itemAt b 4)))
+        push m ((((itemAt a 3) * (itemAt b 2)) + ((itemAt a 4) * (itemAt b 5))) + (itemAt a 5))
+        return m
+    }
+
+    ; ---- writing ----
+
+    ; The message encoded with the file's own schema, as a canvas.fig.
+    fn canvasBytes:buffer () {
+        def enc (new KiwiEncode())
+        enc.init(schema)
+        def raw:buffer (enc.encodeNamed(rootType message))
+        def dz (new Deflate)
+        def w (new DeflateWriter)
+        dz.compress(raw (buffer_length raw) w)
+        def packed:buffer (w.out.toBuffer())
+        def plen:int (w.out.size())
+        def exact:buffer (buffer_alloc plen)
+        def i:int 0
+        while (i < plen) {
+            buffer_set exact i (buffer_get packed i)
+            i = (i + 1)
+        }
+        return (FigCanvas.assemble(prelude version schemaChunk exact))
+    }
+
+    ; The whole file: canvas.fig first, then every other entry it came with.
+    ; `keepImage` names the images/ entries to keep; an empty map keeps all.
+    fn toFig:buffer () {
+        def all:[string:boolean]
+        return (this.toFigKeeping(all false))
+    }
+
+    fn toFigKeeping:buffer (images:[string:boolean] filter:boolean) {
+        def canvas:buffer (this.canvasBytes())
+        def zip (new ZipWriter())
+        zip.create()
+        zip.addFile("canvas.fig" canvas)
+        if pasted {
+            zip.addFile("thumbnail.png" (FigThumb.png(128 96 255 255 255)))
+            zip.addString("meta.json" "{\"client_meta\":{\"background_color\":{\"r\":1,\"g\":1,\"b\":1,\"a\":1},\"thumbnail_size\":{\"width\":128,\"height\":96}},\"file_name\":\"Edited\"}")
+            zip.addDirectory("images/")
+            return (zip.toBuffer())
+        }
+        def i:int 0
+        while (i < (array_length entryNames)) {
+            def fn:string (itemAt entryNames i)
+            def keep:boolean true
+            if filter {
+                def hash:string (FigEditDoc.imageName(fn))
+                if ((strlen hash) > 0) {
+                    keep = (has images hash)
+                }
+            }
+            if keep {
+                def l:int (strlen fn)
+                if ((l > 0) && ((charAt fn (l - 1)) == 47)) {
+                    zip.addDirectory(fn)
+                } {
+                    zip.addFile(fn (itemAt entryData i))
+                }
+            }
+            i = (i + 1)
+        }
+        return (zip.toBuffer())
+    }
+
+    ; "images/abc…" → "abc…", "" for anything else.
+    sfn imageName:string (fn:string) {
+        def l:int (strlen fn)
+        def at:int -1
+        def i:int 0
+        while ((i + 7) <= l) {
+            if ((substring fn i (i + 7)) == "images/") {
+                at = (i + 7)
+            }
+            i = (i + 1)
+        }
+        if ((at < 0) || (at >= l)) {
+            return ""
+        }
+        return (substring fn at l)
+    }
+}

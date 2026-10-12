@@ -1,0 +1,498 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; KiwiJson — JSON text to a KiwiValue and back, whole.
+;
+; KiwiValue.toJson is a reader's printout: it stops at depth 8 and prints a
+; byte array as its length. A variation is stored as JSON and compared as
+; JSON, so it needs both directions and no limit. A value read here is
+; kiwi-shaped already: an object is a message or a struct, a string may be
+; an enum member, and the encoder turns a number into whichever of int,
+; uint or float the schema asks for.
+;
+; Bytes have no JSON form and are never written by a caller: they print as
+; {"$bytes":<length>} so two values that differ only there still compare
+; as different.
+
+Import "../KiwiValue.rgr"
+
+class KiwiJson {
+    def text:string ""
+    def pos:int 0
+    def n:int 0
+    def ok:boolean true
+    def err:string ""
+
+    Constructor () {
+    }
+
+    sfn parse:KiwiValue (src:string) {
+        def p (new KiwiJson())
+        return (p.read(src))
+    }
+
+    fn read:KiwiValue (src:string) {
+        text = src
+        pos = 0
+        n = (strlen src)
+        ok = true
+        err = ""
+        def v:KiwiValue (this.value())
+        this.ws()
+        if (ok && (pos < n)) {
+            this.fail("text after the value")
+        }
+        if (ok == false) {
+            return (KiwiValue.nilVal())
+        }
+        return v
+    }
+
+    fn fail:void (msg:string) {
+        if ok {
+            ok = false
+            err = (msg + " at " + (to_string pos))
+        }
+    }
+
+    fn ws:void () {
+        while (pos < n) {
+            def c:int (charAt text pos)
+            if ((c == 32) || (c == 9) || (c == 10) || (c == 13)) {
+                pos = (pos + 1)
+            } {
+                return
+            }
+        }
+    }
+
+    fn value:KiwiValue () {
+        this.ws()
+        if (pos >= n) {
+            this.fail("value expected")
+            return (KiwiValue.nilVal())
+        }
+        def c:int (charAt text pos)
+        if (c == 123) {
+            return (this.object())
+        }
+        if (c == 91) {
+            return (this.array())
+        }
+        if (c == 34) {
+            return (KiwiValue.fromString((this.str())))
+        }
+        if (this.word("true")) {
+            return (KiwiValue.fromBool(true))
+        }
+        if (this.word("false")) {
+            return (KiwiValue.fromBool(false))
+        }
+        if (this.word("null")) {
+            return (KiwiValue.nilVal())
+        }
+        return (this.number())
+    }
+
+    fn word:boolean (w:string) {
+        def l:int (strlen w)
+        if ((pos + l) > n) {
+            return false
+        }
+        if ((substring text pos (pos + l)) == w) {
+            pos = (pos + l)
+            return true
+        }
+        return false
+    }
+
+    fn object:KiwiValue () {
+        def o:KiwiValue (KiwiValue.fromObject())
+        pos = (pos + 1)
+        this.ws()
+        if ((pos < n) && ((charAt text pos) == 125)) {
+            pos = (pos + 1)
+            return o
+        }
+        while (ok && (pos < n)) {
+            this.ws()
+            if ((pos >= n) || ((charAt text pos) != 34)) {
+                this.fail("name expected")
+                return o
+            }
+            def name:string (this.str())
+            this.ws()
+            if ((pos >= n) || ((charAt text pos) != 58)) {
+                this.fail("':' expected")
+                return o
+            }
+            pos = (pos + 1)
+            o.put(name (this.value()))
+            this.ws()
+            if (pos >= n) {
+                this.fail("'}' expected")
+                return o
+            }
+            def c:int (charAt text pos)
+            pos = (pos + 1)
+            if (c == 125) {
+                return o
+            }
+            if (c != 44) {
+                this.fail("',' expected")
+                return o
+            }
+        }
+        return o
+    }
+
+    fn array:KiwiValue () {
+        def a:KiwiValue (KiwiValue.fromArray())
+        pos = (pos + 1)
+        this.ws()
+        if ((pos < n) && ((charAt text pos) == 93)) {
+            pos = (pos + 1)
+            return a
+        }
+        while (ok && (pos < n)) {
+            a.pushItem((this.value()))
+            this.ws()
+            if (pos >= n) {
+                this.fail("']' expected")
+                return a
+            }
+            def c:int (charAt text pos)
+            pos = (pos + 1)
+            if (c == 93) {
+                return a
+            }
+            if (c != 44) {
+                this.fail("',' expected")
+                return a
+            }
+        }
+        return a
+    }
+
+    fn str:string () {
+        pos = (pos + 1)
+        def out:string ""
+        def from:int pos
+        while (pos < n) {
+            def c:int (charAt text pos)
+            if (c == 34) {
+                out = (out + (substring text from pos))
+                pos = (pos + 1)
+                return out
+            }
+            if (c == 92) {
+                out = (out + (substring text from pos))
+                pos = (pos + 1)
+                if (pos >= n) {
+                    this.fail("bad escape")
+                    return out
+                }
+                def e:int (charAt text pos)
+                pos = (pos + 1)
+                if (e == 110) {
+                    out = (out + "\n")
+                } {
+                    if (e == 116) {
+                        out = (out + "\t")
+                    } {
+                        if (e == 114) {
+                            out = (out + "\r")
+                        } {
+                            if (e == 98) {
+                                out = (out + (strfromcode 8))
+                            } {
+                                if (e == 102) {
+                                    out = (out + (strfromcode 12))
+                                } {
+                                    if (e == 117) {
+                                        out = (out + (strfromcode (this.unicodeEscape())))
+                                    } {
+                                        out = (out + (strfromcode e))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                from = pos
+            } {
+                pos = (pos + 1)
+            }
+        }
+        this.fail("unterminated string")
+        return out
+    }
+
+    ; \uXXXX, joined with a following low surrogate when it is a high one.
+    fn unicodeEscape:int () {
+        def hi:int (this.hex4())
+        if ((hi >= 55296) && (hi <= 56319) && ((pos + 6) <= n)) {
+            if (((charAt text pos) == 92) && ((charAt text (pos + 1)) == 117)) {
+                def save:int pos
+                pos = (pos + 2)
+                def lo:int (this.hex4())
+                if ((lo >= 56320) && (lo <= 57343)) {
+                    return (65536 + ((hi - 55296) * 1024) + (lo - 56320))
+                }
+                pos = save
+            }
+        }
+        return hi
+    }
+
+    fn hex4:int () {
+        def v:int 0
+        def i:int 0
+        while (i < 4) {
+            if (pos >= n) {
+                this.fail("bad \\u escape")
+                return 0
+            }
+            def c:int (charAt text pos)
+            def d:int -1
+            if ((c >= 48) && (c <= 57)) {
+                d = (c - 48)
+            }
+            if ((c >= 97) && (c <= 102)) {
+                d = (c - 87)
+            }
+            if ((c >= 65) && (c <= 70)) {
+                d = (c - 55)
+            }
+            if (d < 0) {
+                this.fail("bad \\u escape")
+                return 0
+            }
+            v = ((v * 16) + d)
+            pos = (pos + 1)
+            i = (i + 1)
+        }
+        return v
+    }
+
+    fn number:KiwiValue () {
+        def from:int pos
+        def real:boolean false
+        while (pos < n) {
+            def c:int (charAt text pos)
+            if (((c >= 48) && (c <= 57)) || (c == 45) || (c == 43)) {
+                pos = (pos + 1)
+            } {
+                if ((c == 46) || (c == 101) || (c == 69)) {
+                    real = true
+                    pos = (pos + 1)
+                } {
+                    break
+                }
+            }
+        }
+        if (pos == from) {
+            this.fail("value expected")
+            return (KiwiValue.nilVal())
+        }
+        def s:string (substring text from pos)
+        if real {
+            def d@(optional):double (to_double s)
+            if (null? d) {
+                this.fail(("bad number " + s))
+                return (KiwiValue.nilVal())
+            }
+            return (KiwiValue.fromDouble((unwrap d)))
+        }
+        def i@(optional):int (to_int s)
+        if (null? i) {
+            this.fail(("bad number " + s))
+            return (KiwiValue.nilVal())
+        }
+        return (KiwiValue.fromInt((unwrap i)))
+    }
+
+    ; ---- writing ----
+
+    sfn write:string (v:KiwiValue) {
+        if (v.kind == 0) {
+            return "null"
+        }
+        if (v.kind == 1) {
+            if v.boolVal {
+                return "true"
+            }
+            return "false"
+        }
+        if (v.kind == 2) {
+            return (to_string v.intVal)
+        }
+        if (v.kind == 3) {
+            return (KiwiJson.num(v.doubleVal))
+        }
+        if (v.kind == 4) {
+            return (KiwiJson.quote(v.stringVal))
+        }
+        if (v.kind == 7) {
+            return ("{\"$bytes\":" + (to_string (buffer_length v.bytesVal)) + "}")
+        }
+        if (v.kind == 5) {
+            def out:string "["
+            def i:int 0
+            while (i < (array_length v.items)) {
+                if (i > 0) {
+                    out = (out + ",")
+                }
+                out = (out + (KiwiJson.write((itemAt v.items i))))
+                i = (i + 1)
+            }
+            return (out + "]")
+        }
+        def o:string "{"
+        def j:int 0
+        while (j < (array_length v.fieldNames)) {
+            if (j > 0) {
+                o = (o + ",")
+            }
+            o = (o + (KiwiJson.quote((itemAt v.fieldNames j))) + ":" + (KiwiJson.write((itemAt v.fieldVals j))))
+            j = (j + 1)
+        }
+        return (o + "}")
+    }
+
+    ; A whole number prints without a fraction, so 12 read back as an int
+    ; and 12.0 kept as a float compare as the same value.
+    sfn num:string (d:double) {
+        def i:int (to_int d)
+        if ((to_double i) == d) {
+            return (to_string i)
+        }
+        return (to_string d)
+    }
+
+    sfn quote:string (s:string) {
+        def out:string "\""
+        def n:int (strlen s)
+        def from:int 0
+        def i:int 0
+        while (i < n) {
+            def c:int (charAt s i)
+            def esc:string ""
+            if (c == 34) {
+                esc = "\\\""
+            }
+            if (c == 92) {
+                esc = "\\\\"
+            }
+            if (c == 10) {
+                esc = "\\n"
+            }
+            if (c == 13) {
+                esc = "\\r"
+            }
+            if (c == 9) {
+                esc = "\\t"
+            }
+            if (((strlen esc) == 0) && (c < 32)) {
+                esc = ("\\u00" + (KiwiJson.hex2(c)))
+            }
+            if ((strlen esc) > 0) {
+                out = (out + (substring s from i) + esc)
+                from = (i + 1)
+            }
+            i = (i + 1)
+        }
+        return (out + (substring s from n) + "\"")
+    }
+
+    sfn hex2:string (c:int) {
+        def digits:string "0123456789abcdef"
+        return ((substring digits (idiv c 16) ((idiv c 16) + 1)) + (substring digits (c % 16) ((c % 16) + 1)))
+    }
+
+    ; Equal as values: an object's fields in any order, a whole double equal
+    ; to the int it holds.
+    sfn same:boolean (a:KiwiValue b:KiwiValue) {
+        def ka:int a.kind
+        def kb:int b.kind
+        if (((ka == 2) || (ka == 3)) && ((kb == 2) || (kb == 3))) {
+            return ((a.asDouble(0.0)) == (b.asDouble(0.0)))
+        }
+        if (ka != kb) {
+            return false
+        }
+        if (ka == 0) {
+            return true
+        }
+        if (ka == 1) {
+            return (a.boolVal == b.boolVal)
+        }
+        if (ka == 4) {
+            return (a.stringVal == b.stringVal)
+        }
+        if (ka == 7) {
+            def n:int (buffer_length a.bytesVal)
+            if (n != (buffer_length b.bytesVal)) {
+                return false
+            }
+            def i:int 0
+            while (i < n) {
+                if ((buffer_get a.bytesVal i) != (buffer_get b.bytesVal i)) {
+                    return false
+                }
+                i = (i + 1)
+            }
+            return true
+        }
+        if (ka == 5) {
+            if ((array_length a.items) != (array_length b.items)) {
+                return false
+            }
+            def j:int 0
+            while (j < (array_length a.items)) {
+                if ((KiwiJson.same((itemAt a.items j) (itemAt b.items j))) == false) {
+                    return false
+                }
+                j = (j + 1)
+            }
+            return true
+        }
+        if ((array_length a.fieldNames) != (array_length b.fieldNames)) {
+            return false
+        }
+        def k:int 0
+        while (k < (array_length a.fieldNames)) {
+            def name:string (itemAt a.fieldNames k)
+            if ((b.hasField(name)) == false) {
+                return false
+            }
+            if ((KiwiJson.same((itemAt a.fieldVals k) (b.field(name)))) == false) {
+                return false
+            }
+            k = (k + 1)
+        }
+        return true
+    }
+
+    ; A copy that shares nothing but byte arrays, which nobody edits.
+    sfn clone:KiwiValue (v:KiwiValue) {
+        def c (new KiwiValue())
+        c.kind = v.kind
+        c.boolVal = v.boolVal
+        c.intVal = v.intVal
+        c.doubleVal = v.doubleVal
+        c.stringVal = v.stringVal
+        c.bytesVal = v.bytesVal
+        def i:int 0
+        while (i < (array_length v.items)) {
+            push c.items (KiwiJson.clone((itemAt v.items i)))
+            i = (i + 1)
+        }
+        def j:int 0
+        while (j < (array_length v.fieldNames)) {
+            push c.fieldNames (itemAt v.fieldNames j)
+            push c.fieldVals (KiwiJson.clone((itemAt v.fieldVals j)))
+            j = (j + 1)
+        }
+        return c
+    }
+}

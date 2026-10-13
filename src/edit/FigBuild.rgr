@@ -1,0 +1,424 @@
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
+; FigBuild — a file made from nothing, and layers added to one.
+;
+; A new file is the smallest one Figma opens: a DOCUMENT and one CANVAS,
+; written by SceneToFig like every other file this repository makes. What
+; goes on it is added as layers, each described by a small JSON spec:
+;
+;   { "type": "frame", "name": "Login", "x": 0, "y": 0, "w": 375, "h": 812,
+;     "fill": "#ffffff", "radius": 12, "clip": true,
+;     "children": [
+;       { "type": "text", "text": "Sign in", "x": 24, "y": 80, "fontSize": 28,
+;         "bold": true, "fill": "#111111" },
+;       { "type": "rectangle", "x": 24, "y": 400, "w": 327, "h": 48,
+;         "fill": "#3366ff", "radius": 8 } ] }
+;
+;   types   page, frame, rectangle, ellipse, text, line, vector
+;
+; A spec becomes a SceneNode and SceneToFig writes its node changes, so an
+; added layer is the same node change a converted document would have had:
+; one writer, not two. The changes go straight into an open FigEditDoc,
+; under a session id of their own (FigVariation keeps the spec, not the
+; nodes, as it keeps a copy by what it copied).
+
+Import "FigEdit.rgr"
+Import "KiwiJson.rgr"
+Import "../write/SceneToFig.rgr"
+Import "../write/FigWrite.rgr"
+
+class FigBuild {
+
+    ; A new file with one empty page.
+    sfn blank:buffer (fileName:string pageName:string) {
+        def doc (new SceneDocument())
+        doc.name = fileName
+        def page (new SceneNode())
+        page.name = pageName
+        if ((strlen pageName) == 0) {
+            page.name = "Page 1"
+        }
+        page.sourceType = "CANVAS"
+        push doc.pages page
+        return (SceneToFig.write(doc fileName))
+    }
+
+    ; ---- where things go ----
+
+    sfn documentId:string (doc:FigEditDoc) {
+        def all:[string] (doc.allIds())
+        def i:int 0
+        while (i < (array_length all)) {
+            if ((doc.typeOf((itemAt all i))) == "DOCUMENT") {
+                return (itemAt all i)
+            }
+            i = (i + 1)
+        }
+        return ""
+    }
+
+    ; The first page a person sees: Figma keeps an "Internal Only Canvas"
+    ; for its own use, and nothing is added there.
+    sfn firstPage:string (doc:FigEditDoc) {
+        def pages:[string] (doc.children((FigBuild.documentId(doc))))
+        def i:int 0
+        while (i < (array_length pages)) {
+            def id:string (itemAt pages i)
+            def nd:KiwiValue (unwrap (doc.node(id)))
+            if (((nd.childString("type" "")) == "CANVAS") && ((nd.childBool("internalOnly" false)) == false)) {
+                return id
+            }
+            i = (i + 1)
+        }
+        return ""
+    }
+
+    ; A sibling position after every child `parent` has now, so the new
+    ; layer is drawn on top. Positions compare byte by byte: raising the
+    ; last character makes a larger string, and past "~" one more character
+    ; does.
+    sfn positionAfter:string (doc:FigEditDoc parent:string) {
+        def kids:[string] (doc.children(parent))
+        def last:string ""
+        def i:int 0
+        while (i < (array_length kids)) {
+            def p:string (doc.positionOf((itemAt kids i)))
+            if ((FigEditDoc.compare(p last)) > 0) {
+                last = p
+            }
+            i = (i + 1)
+        }
+        def n:int (strlen last)
+        if (n == 0) {
+            return (FigWrite.positionAt(0))
+        }
+        def c:int (charAt last (n - 1))
+        if (c < 126) {
+            return ((substring last 0 (n - 1)) + (strfromcode (c + 1)))
+        }
+        return (last + (strfromcode 33))
+    }
+
+    ; "s:l" → s (which 0) or l (which 1)
+    sfn part:int (id:string which:int) {
+        def bits:[string] (strsplit id ":")
+        if ((array_length bits) != 2) {
+            return 0
+        }
+        def v@(optional):int (to_int (itemAt bits which))
+        return (?? v 0)
+    }
+
+    sfn holdsLayers:boolean (type:string) {
+        def ok:[string] ([] _:string ("CANVAS" "FRAME" "GROUP" "SECTION" "SYMBOL" "COMPONENT" "COMPONENT_SET" "INSTANCE"))
+        def i:int 0
+        while (i < (array_length ok)) {
+            if ((itemAt ok i) == type) {
+                return true
+            }
+            i = (i + 1)
+        }
+        return false
+    }
+
+    ; ---- adding ----
+
+    ; `spec` added under `parent` ("" = the first page; a page under the
+    ; document), its top layer as `sid`:1 and the layers below it `sid`:2…
+    ; "" when it was added, else why not. What the file cannot carry
+    ; exactly (a font Figma does not ship) is put in `notes`.
+    sfn add:string (doc:FigEditDoc parent:string sid:int spec:KiwiValue notes:[string]) {
+        if ((spec.isObject()) == false) {
+            return "a layer must be a JSON object"
+        }
+        def type:string (to_lowercase (spec.childString("type" "")))
+        def pid:string parent
+        if (type == "page") {
+            if ((strlen pid) == 0) {
+                pid = (FigBuild.documentId(doc))
+            }
+            if ((doc.typeOf(pid)) != "DOCUMENT") {
+                return "a page goes under the document"
+            }
+            def canvas:KiwiValue (FigWrite.node(sid 1 "CANVAS" (spec.childString("name" "Page"))))
+            canvas.put("parentIndex" (FigWrite.parentIndex((FigBuild.part(pid 0)) (FigBuild.part(pid 1)) (FigBuild.positionAfter(doc pid)))))
+            canvas.put("transform" (FigWrite.xform(0.0 0.0)))
+            def nc0:KiwiValue (doc.nodes())
+            nc0.pushItem(canvas)
+            doc.reindex()
+            return ""
+        }
+        if ((strlen pid) == 0) {
+            pid = (FigBuild.firstPage(doc))
+            if ((strlen pid) == 0) {
+                return "the file has no page to add to"
+            }
+        }
+        if ((doc.exists(pid)) == false) {
+            return ("no layer " + pid + " to add to")
+        }
+        def ptype:string (doc.typeOf(pid))
+        if ((FigBuild.holdsLayers(ptype)) == false) {
+            return ("a " + ptype + " cannot hold layers; add to a page or a frame")
+        }
+        def errs:[string]
+        def n:SceneNode (FigBuild.sceneOf(spec "" errs))
+        if ((array_length errs) > 0) {
+            return (join errs "; ")
+        }
+        def w (new SceneToFig())
+        def nodes:KiwiValue (KiwiValue.fromArray())
+        w.nodes = nodes
+        def bl:KiwiValue (doc.message.field("blobs"))
+        if ((bl.isArray()) == false) {
+            bl = (KiwiValue.fromArray())
+            doc.message.put("blobs" bl)
+        }
+        w.blobs = bl
+        w.nextLocal = 1
+        w.emit(n sid (FigBuild.part(pid 0)) (FigBuild.part(pid 1)) 0 (n.name))
+        def top:KiwiValue (nodes.item(0))
+        def pi:KiwiValue (top.field("parentIndex"))
+        pi.put("position" (KiwiValue.fromString((FigBuild.positionAfter(doc pid)))))
+        def nc:KiwiValue (doc.nodes())
+        def i:int 0
+        while (i < (nodes.itemCount())) {
+            nc.pushItem((nodes.item(i)))
+            i = (i + 1)
+        }
+        def k:int 0
+        while (k < (array_length w.losses)) {
+            push notes (itemAt w.losses k)
+            k = (k + 1)
+        }
+        doc.reindex()
+        return ""
+    }
+
+    ; ---- a spec as a scene node ----
+
+    sfn sceneOf:SceneNode (spec:KiwiValue at:string errs:[string]) {
+        def n (new SceneNode())
+        def type:string (to_lowercase (spec.childString("type" "")))
+        def where:string at
+        if ((strlen where) == 0) {
+            where = type
+        }
+        def defW:double 100.0
+        def defH:double 100.0
+        def defFill:string "#d9d9d9"
+        if (type == "frame") {
+            n.sourceType = "FRAME"
+            n.name = "Frame"
+            defW = 1440.0
+            defH = 1024.0
+            defFill = "#ffffff"
+            n.clip = (spec.childBool("clip" true))
+        }
+        if (type == "rectangle") {
+            n.name = "Rectangle"
+        }
+        if (type == "ellipse") {
+            n.sourceType = "ELLIPSE"
+            n.name = "Ellipse"
+        }
+        if (type == "line") {
+            n.sourceType = "LINE"
+            n.name = "Line"
+            defH = 0.0
+            defFill = "none"
+        }
+        if (type == "vector") {
+            n.kind = "path"
+            n.sourceType = "VECTOR"
+            n.name = "Vector"
+            defFill = "#000000"
+            n.pathData = (spec.childString("path" ""))
+            if ((strlen n.pathData) == 0) {
+                push errs (where + ": a vector needs \"path\", an SVG path in its own w x h box")
+            }
+            n.evenOdd = ((spec.childString("fillRule" "")) == "evenodd")
+        }
+        if (type == "text") {
+            n.kind = "text"
+            n.name = "Text"
+            defFill = "#000000"
+            FigBuild.textOf(n spec where errs)
+            defW = n.w
+            defH = n.h
+        }
+        if (n.name == "") {
+            push errs (where + ": type must be page, frame, rectangle, ellipse, text, line or vector")
+            return n
+        }
+        n.name = (spec.childString("name" n.name))
+        n.x = (spec.childDouble("x" 0.0))
+        n.y = (spec.childDouble("y" 0.0))
+        n.w = (spec.childDouble("w" defW))
+        n.h = (spec.childDouble("h" defH))
+        if ((n.w < 0.0) || (n.h < 0.0)) {
+            push errs (where + ": w and h cannot be negative")
+        }
+        n.pathW = (spec.childDouble("viewW" n.w))
+        n.pathH = (spec.childDouble("viewH" n.h))
+        n.opacity = (spec.childDouble("opacity" 1.0))
+        if (spec.childBool("hidden" false)) {
+            n.visible = false
+        }
+        def fill:string (spec.childString("fill" defFill))
+        if (fill != "none") {
+            def c:[double] (FigBuild.rgba(fill))
+            if ((array_length c) == 0) {
+                push errs (where + ": fill must be #rrggbb, #rrggbbaa or none")
+            } {
+                def f (new SceneFill())
+                f.r = (itemAt c 0)
+                f.g = (itemAt c 1)
+                f.b = (itemAt c 2)
+                f.a = (itemAt c 3)
+                push n.fills f
+            }
+        }
+        def stroke:string (spec.childString("stroke" ""))
+        if ((type == "line") && ((strlen stroke) == 0)) {
+            stroke = "#000000"
+        }
+        if (((strlen stroke) > 0) && (stroke != "none")) {
+            def sc:[double] (FigBuild.rgba(stroke))
+            if ((array_length sc) == 0) {
+                push errs (where + ": stroke must be #rrggbb, #rrggbbaa or none")
+            } {
+                def s (new SceneStroke())
+                s.r = (itemAt sc 0)
+                s.g = (itemAt sc 1)
+                s.b = (itemAt sc 2)
+                s.a = (itemAt sc 3)
+                s.weight = (spec.childDouble("strokeWidth" 1.0))
+                push n.strokes s
+            }
+        }
+        def r:double (spec.childDouble("radius" 0.0))
+        if (r > 0.0) {
+            n.radius.tl = r
+            n.radius.tr = r
+            n.radius.br = r
+            n.radius.bl = r
+        }
+        def kids:KiwiValue (spec.field("children"))
+        if (kids.isArray()) {
+            if (type != "frame") {
+                push errs (where + ": only a frame has children")
+            } {
+                def i:int 0
+                while (i < (kids.itemCount())) {
+                    def kid:KiwiValue (kids.item(i))
+                    def kt:string (to_lowercase (kid.childString("type" "")))
+                    if (kt == "page") {
+                        push errs (where + "/" + (to_string i) + ": a page cannot be inside a frame")
+                    } {
+                        push n.children (FigBuild.sceneOf(kid (where + "/" + (to_string i)) errs))
+                    }
+                    i = (i + 1)
+                }
+            }
+        }
+        return n
+    }
+
+    ; The words and their face. A text layer with no width grows with its
+    ; words (Figma lays it out again when it opens the file); with a width
+    ; only, it wraps and grows down; with both it is a fixed box. The size
+    ; written for a growing one is an estimate, as nothing here measures.
+    sfn textOf:void (n:SceneNode spec:KiwiValue where:string errs:[string]) {
+        def t:SceneText n.text
+        t.characters = (spec.childString("text" ""))
+        if ((strlen t.characters) == 0) {
+            push errs (where + ": a text layer needs \"text\"")
+        }
+        t.fontFamily = (spec.childString("fontFamily" "Inter"))
+        t.fontSize = (spec.childDouble("fontSize" 16.0))
+        if (t.fontSize <= 0.0) {
+            push errs (where + ": fontSize must be above 0")
+            t.fontSize = 16.0
+        }
+        if (spec.childBool("bold" false)) {
+            t.fontWeight = "bold"
+        }
+        t.lineHeight = (spec.childDouble("lineHeight" 0.0))
+        t.align = (to_lowercase (spec.childString("align" "left")))
+        def lines:[string] (strsplit t.characters "\n")
+        def longest:int 0
+        def i:int 0
+        while (i < (array_length lines)) {
+            def l:int (strlen (itemAt lines i))
+            if (l > longest) {
+                longest = l
+            }
+            i = (i + 1)
+        }
+        def lh:double t.lineHeight
+        if (lh <= 0.0) {
+            lh = (t.fontSize * 1.21)
+        }
+        n.w = (FigBuild.ceil(((to_double longest) * t.fontSize * 0.56)))
+        n.h = (FigBuild.ceil(((to_double (array_length lines)) * lh)))
+        def hasW:boolean (spec.hasField("w"))
+        def hasH:boolean (spec.hasField("h"))
+        t.autoResize = "both"
+        if hasW {
+            t.autoResize = "height"
+            if hasH {
+                t.autoResize = "none"
+            }
+        }
+    }
+
+    sfn ceil:double (v:double) {
+        def i:int (to_int v)
+        if ((to_double i) < v) {
+            return (to_double (i + 1))
+        }
+        return (to_double i)
+    }
+
+    ; "#rrggbb" / "#rrggbbaa" as r, g, b, a in 0…1; empty when it is neither.
+    sfn rgba:[double] (hex:string) {
+        def out:[double]
+        def h:string hex
+        if (((strlen h) > 0) && ((charAt h 0) == 35)) {
+            h = (substring h 1 (strlen h))
+        }
+        def n:int (strlen h)
+        if ((n != 6) && (n != 8)) {
+            return out
+        }
+        def vals:[double]
+        def i:int 0
+        while (i < n) {
+            def a:int (FigBuild.hexDigit((charAt h i)))
+            def b:int (FigBuild.hexDigit((charAt h (i + 1))))
+            if ((a < 0) || (b < 0)) {
+                return out
+            }
+            push vals ((to_double ((a * 16) + b)) / 255.0)
+            i = (i + 2)
+        }
+        if (n == 6) {
+            push vals 1.0
+        }
+        return vals
+    }
+
+    sfn hexDigit:int (c:int) {
+        if ((c >= 48) && (c <= 57)) {
+            return (c - 48)
+        }
+        if ((c >= 97) && (c <= 102)) {
+            return (c - 87)
+        }
+        if ((c >= 65) && (c <= 70)) {
+            return (c - 55)
+        }
+        return -1
+    }
+}

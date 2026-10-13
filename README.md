@@ -362,11 +362,21 @@ back as they came.
 | | |
 | --- | --- |
 | `FigEditDoc` | a file opened for changing: nodes by guid, children by position, `toFig()` writes it back; `extract(id)` keeps one layer (on its page, placed where it was) with the components and styles its fields name, and `toFigTrimmed()` writes only the pictures and blobs it still uses |
-| `FigVariation` | a change kept as the change alone (`fig-delta/1`): `copies`, `set` (field paths by node) and `removed`. `edit` takes friendly ops (`text`, `move`, `resize`, `fill`, `hide`, `show`, `opacity`, `rename`, `copy`, `remove`, `revert`, raw `set`) and records field paths; a value equal to the original's is dropped, so a variation set back is `{}` |
+| `FigVariation` | a change kept as the change alone (`fig-delta/1`): `copies`, `added`, `set` (field paths by node) and `removed`. `edit` takes friendly ops (`add`, `text`, `move`, `resize`, `fill`, `hide`, `show`, `opacity`, `rename`, `copy`, `remove`, `revert`, raw `set`) and records field paths; a value equal to the original's is dropped, so a variation set back is `{}` |
+| `FigBuild` | a file from nothing: `blank(name, page)` is a DOCUMENT with one empty page (written by `SceneToFig`), and `add` puts a layer described by a JSON spec on it — `page`, `frame` (with `children`), `rectangle`, `ellipse`, `text`, `line`, `vector` (an SVG path) — by turning the spec into a `SceneNode` and writing it with `SceneToFig`, so an added layer is the node change a converted document would have had |
 | `KiwiJson` | JSON to `KiwiValue` and back, whole, and value equality |
 
 Changed text drops the node's `derivedTextData` (the old shaped glyphs):
 Figma shapes text again on open, and this reader then draws the string.
+
+A new file is a variation of the blank file: its content is the `added`
+specs, kept as specs (as a copy is kept as what it copied) and made again
+whenever the variation is applied. Copies and added layers apply in the
+order they were made, so a layer can be added inside a copy and a copy made
+of an added layer. A copy is of the layer as it was when copied: what had
+been set on it is set on the copy too, and layers removed under it before
+are named in the copy's `without`. Taking back an added layer or a copy
+takes what rests on it (copies of it, layers added inside it).
 
 ## EVG support (used, not extended)
 

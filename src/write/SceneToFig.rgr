@@ -328,6 +328,13 @@ class SceneToFig {
         }
         if n.clip {
             o.put("frameMaskDisabled" (KiwiValue.fromBool(false)))
+        } {
+            ; A frame with no flag CLIPS — that is Figma's default and the
+            ; reader's (`FigToScene.copyClip`) — so a frame that does not
+            ; clip has to say so, or it comes back clipping.
+            if (typeName == "FRAME") {
+                o.put("frameMaskDisabled" (KiwiValue.fromBool(true)))
+            }
         }
         this.putFills(o n path)
         this.putStroke(o n path)
